@@ -136,6 +136,20 @@ try:
                     )  # [chunk, b, V/TP] (no re-gather: SP disabled)
                     if scale_logits_fn is not None:
                         logits_slice = scale_logits_fn(logits_slice)
+                    # TE's fused CE consumes logits in place. Acceptance must
+                    # therefore read the original values before CE rather than
+                    # forcing a full logits-sized preservation copy.
+                    if _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None:
+                        chunk_correct, chunk_total = _COMPUTE_MTP_ACCEPTANCE_COUNTS(
+                            logits_slice,
+                            mtp_labels[:, start:end],
+                            loss_mask[:, start:end],
+                            output_layer,
+                            runtime_gather_output,
+                            tp_group,
+                        )
+                        correct = chunk_correct if correct is None else correct + chunk_correct
+                        total = chunk_total if total is None else total + chunk_total
                     # compute_language_model_loss(labels[b,s], logits[s,b,V]) -> [b, s];
                     # slice labels on the seq axis (dim=1) to match the logits slice.
                     if ce_implementation("MTP") == "te":
@@ -148,17 +162,6 @@ try:
                     else:
                         loss_slice = compute_language_model_loss(mtp_labels[:, start:end], logits_slice)
                     per_chunk_losses.append(loss_slice)
-                    if _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None:
-                        chunk_correct, chunk_total = _COMPUTE_MTP_ACCEPTANCE_COUNTS(
-                            logits_slice,
-                            mtp_labels[:, start:end],
-                            loss_mask[:, start:end],
-                            output_layer,
-                            runtime_gather_output,
-                            tp_group,
-                        )
-                        correct = chunk_correct if correct is None else correct + chunk_correct
-                        total = chunk_total if total is None else total + chunk_total
                     del logits_slice
             finally:
                 if sp_enabled:

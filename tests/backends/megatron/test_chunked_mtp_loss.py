@@ -164,6 +164,48 @@ def test_scale_logits_fn_per_chunk(monkeypatch):
         assert torch.equal(g, r)
 
 
+def test_te_ce_runs_after_acceptance_metric(monkeypatch):
+    """Acceptance observes logits before TE CE consumes them in place."""
+    events = []
+
+    def acceptance(logits, *_args, **_kwargs):
+        events.append(("acceptance", logits.detach().clone()))
+        return torch.tensor(1), torch.tensor(2)
+
+    def destructive_te_ce(logits, labels, _group):
+        events.append(("ce", logits.detach().clone()))
+        with torch.no_grad():
+            logits.zero_()
+        return logits.new_zeros(labels.shape)
+
+    monkeypatch.setattr(_patch, "_COMPUTE_MTP_ACCEPTANCE_COUNTS", acceptance)
+    monkeypatch.setattr(_patch, "ce_implementation", lambda branch: "te")
+    monkeypatch.setattr(_patch, "te_cross_entropy", destructive_te_ce)
+
+    hidden = torch.randn(5, B, H)
+    labels = torch.randint(0, V, (B, 5))
+    loss, correct, total = _patch._chunked_head_ce(
+        hidden,
+        labels,
+        _FakeHead(H, V),
+        None,
+        None,
+        _stub_clml,
+        None,
+        chunk_size=2,
+        tp_group=object(),
+        loss_mask=torch.ones_like(labels),
+    )
+
+    assert [kind for kind, _ in events] == ["acceptance", "ce"] * 3
+    for acceptance_event, ce_event in zip(events[::2], events[1::2]):
+        torch.testing.assert_close(acceptance_event[1], ce_event[1])
+        assert torch.count_nonzero(acceptance_event[1]) > 0
+    assert loss.shape == labels.shape
+    assert correct.item() == 3
+    assert total.item() == 6
+
+
 def test_calculate_per_token_loss_branch(monkeypatch):
     """The per-token-loss normalization branch is preserved under chunking."""
     head = _FakeHead(H, V)

@@ -38,7 +38,9 @@ def te_cross_entropy(logits: torch.Tensor, labels: torch.Tensor, tp_group=None) 
     Transformer Engine expects a three-dimensional input, so flatten arbitrary
     leading token dimensions to ``[1, tokens, vocab/TP]`` and restore the label
     shape afterwards. Targets remain global vocabulary IDs; TE uses
-    ``tp_group`` to combine the per-rank online-softmax statistics.
+    ``tp_group`` to combine the per-rank online-softmax statistics. The TE
+    kernel consumes contiguous logits in place; callers must read any metrics
+    derived from logits before invoking this function.
     """
     if logits.ndim < 2 or labels.shape != logits.shape[:-1]:
         raise ValueError("TE CE requires labels to match every logits dimension except the vocabulary dimension")

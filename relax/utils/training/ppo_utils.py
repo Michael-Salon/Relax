@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from relax.algorithms import algorithm_needs_critic
 from relax.utils.logging_utils import get_logger
+from relax.utils.training.fused_ce import ce_implementation, te_cross_entropy
 
 
 logger = get_logger(__name__)
@@ -667,6 +668,12 @@ def _calculate_log_probs_and_entropy_chunk(
     with_entropy_grad: bool = True,
     log_prob_keep_mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if not with_entropy and log_prob_keep_mask is None and ce_implementation("LOGPROB") == "te":
+        # TE fuses the online softmax, target gather, and CE work into Triton
+        # kernels and handles vocabulary-parallel reductions through tp_group.
+        # Return negative CE to preserve this API's log-probability contract.
+        return -te_cross_entropy(logits, tokens, tp_group).unsqueeze(-1), None
+
     log_prob, entropy = _VocabParallelLogProbEntropy.apply(
         logits,
         tokens,

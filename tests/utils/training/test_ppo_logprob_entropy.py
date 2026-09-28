@@ -7,6 +7,7 @@ import socket
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from relax.utils.training import ppo_utils
 from relax.utils.training.ppo_utils import calculate_log_probs_and_entropy
@@ -324,6 +325,66 @@ def test_logprob_fast_path_skips_single_rank_all_reduce(monkeypatch: pytest.Monk
     monkeypatch.setattr(ppo_utils, "_get_vocab_parallel_rank_size", lambda group: (0, 2))
     ppo_utils._maybe_all_reduce(tensor, ppo_utils.dist.ReduceOp.SUM, None)
     assert len(calls) == 2
+
+
+def test_te_fused_logprob_path_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    logits = _single_rank_logits().requires_grad_()
+    tokens = torch.tensor([3, 0, 1], dtype=torch.long)
+    calls = []
+
+    monkeypatch.setattr(
+        ppo_utils,
+        "ce_implementation",
+        lambda branch: "te" if branch == "LOGPROB" else "native",
+    )
+
+    def fake_te_cross_entropy(local_logits, labels, tp_group):
+        calls.append((local_logits.shape, labels.shape, tp_group))
+        return F.cross_entropy(local_logits, labels, reduction="none")
+
+    monkeypatch.setattr(ppo_utils, "te_cross_entropy", fake_te_cross_entropy)
+    actual, entropy = calculate_log_probs_and_entropy(
+        logits,
+        tokens,
+        tp_group=None,
+        with_entropy=False,
+    )
+    expected = F.log_softmax(logits, dim=-1).gather(-1, tokens.unsqueeze(-1))
+
+    assert entropy is None
+    assert calls == [((3, 4), (3,), None)]
+    torch.testing.assert_close(actual, expected)
+
+    upstream = torch.tensor([[0.25], [-0.5], [1.5]])
+    (actual_grad,) = torch.autograd.grad(actual, logits, upstream)
+    (expected_grad,) = torch.autograd.grad(expected, logits, upstream)
+    torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize("with_entropy,with_mask", [(True, False), (False, True)])
+def test_te_fused_logprob_falls_back_for_unsupported_outputs(
+    monkeypatch: pytest.MonkeyPatch, with_entropy: bool, with_mask: bool
+) -> None:
+    logits = _single_rank_logits().requires_grad_()
+    tokens = torch.tensor([3, 0, 1], dtype=torch.long)
+    keep_mask = _single_rank_keep_mask() if with_mask else None
+
+    monkeypatch.setattr(ppo_utils, "ce_implementation", lambda branch: "te")
+    monkeypatch.setattr(
+        ppo_utils,
+        "te_cross_entropy",
+        lambda *args, **kwargs: pytest.fail("TE CE must not run when entropy or a keep-mask is requested"),
+    )
+    log_probs, entropy = calculate_log_probs_and_entropy(
+        logits,
+        tokens,
+        tp_group=None,
+        with_entropy=with_entropy,
+        log_prob_keep_mask=keep_mask,
+    )
+
+    assert log_probs.shape == (3, 1)
+    assert (entropy is not None) is with_entropy
 
 
 def test_metric_only_entropy_does_not_save_entropy_backward_tensors() -> None:

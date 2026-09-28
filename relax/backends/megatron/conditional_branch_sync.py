@@ -171,8 +171,18 @@ def _run_dummy_vision(model: torch.nn.Module, device: torch.device) -> torch.Ten
     return _sum_tensors(vision_model(hidden_states=dummy_data, grid_thw=dummy_grid_thw))
 
 
-def _attach_zero_dependency(output: torch.Tensor, dependency: torch.Tensor) -> torch.Tensor:
-    return output + dependency.to(dtype=output.dtype, device=output.device) * 0
+def _attach_zero_dependency(
+    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor], dependency: torch.Tensor
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(output, torch.Tensor):
+        return output + dependency.to(dtype=output.dtype, device=output.device) * 0
+    if isinstance(output, tuple) and len(output) == 2 and all(isinstance(value, torch.Tensor) for value in output):
+        hidden_states, loss_mask = output
+        return _attach_zero_dependency(hidden_states, dependency), loss_mask
+    raise TypeError(
+        "Qwen3VL conditional branch sync expected a tensor or (output, loss_mask) tensor pair, "
+        f"got {type(output).__name__}"
+    )
 
 
 def install_conditional_branch_sync(args: argparse.Namespace, model: torch.nn.Module) -> None:
@@ -192,8 +202,6 @@ def install_conditional_branch_sync(args: argparse.Namespace, model: torch.nn.Mo
 
         output = original_forward(*forward_args, **forward_kwargs)
         if dependency is not None:
-            if not isinstance(output, torch.Tensor):
-                raise TypeError(f"Qwen3VL conditional branch sync expected tensor output, got {type(output).__name__}")
             output = _attach_zero_dependency(output, dependency)
         return output
 

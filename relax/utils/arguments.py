@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import warnings
@@ -77,6 +78,14 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _nonnegative_finite_float(value: str) -> float:
+    """argparse type for bounded auxiliary-loss coefficients."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a finite non-negative float, got {value!r}")
     return parsed
 
 
@@ -336,6 +345,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="thd",
                 help="The qkv layout for Megatron backend.",
             )
+            qsa_coeff_option = "--qsa-indexer-loss-coeff"
+            if qsa_coeff_option in parser._option_string_actions:
+                # Megatron registers TransformerConfig fields on newer revisions.
+                qsa_coeff_action = parser._option_string_actions[qsa_coeff_option]
+                qsa_coeff_action.type = _nonnegative_finite_float
+                qsa_coeff_action.default = 0.0
+            else:
+                parser.add_argument(
+                    qsa_coeff_option,
+                    type=_nonnegative_finite_float,
+                    default=0.0,
+                    help="QSA Stage-2 indexer KL coefficient; positive values require the opt-in selected-ID sparse backend.",
+                )
             parser.add_argument(
                 "--true-on-policy-mode",
                 action="store_true",

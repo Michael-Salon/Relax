@@ -1022,6 +1022,10 @@ def post_process_rollout_data(args, rollout_data):
     rollout_data["loss_masks"] = [
         torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
+    if "pre_shifted_labels" in rollout_data:
+        rollout_data["pre_shifted_labels"] = [
+            torch.as_tensor(label, dtype=torch.long, device=cuda_dev) for label in rollout_data["pre_shifted_labels"]
+        ]
     if "classification_labels" in rollout_data:
         label_dtype = (
             torch.long

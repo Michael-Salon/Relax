@@ -474,6 +474,33 @@ def test_pack_samples_for_tq_omits_multimodal_field_for_text_only_batch():
     assert "multimodal_train_inputs" not in batch
 
 
+def test_pack_samples_for_tq_preserves_pre_shifted_labels():
+    sample = _make_text_only_sample()
+    sample.pre_shifted_labels = torch.tensor([-100, 2, 3], dtype=torch.long)
+
+    batch = pack_samples_for_tq([sample])
+
+    assert batch is not None
+    assert batch["pre_shifted_labels"][0] is sample.pre_shifted_labels
+
+
+def test_pack_samples_for_tq_rejects_partial_pre_shifted_labels():
+    first = _make_text_only_sample()
+    first.pre_shifted_labels = torch.tensor([-100, 2, 3], dtype=torch.long)
+    second = _make_text_only_sample()
+
+    with pytest.raises(ValueError, match="every sample"):
+        pack_samples_for_tq([first, second])
+
+
+def test_pack_samples_for_tq_validates_pre_shifted_mask():
+    sample = _make_text_only_sample()
+    sample.pre_shifted_labels = torch.tensor([-100, -100, 3], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="loss mask"):
+        pack_samples_for_tq([sample])
+
+
 def test_dict_to_tensordict_preserves_tensor_list_as_nested_tensor():
     batch = {
         "tokens": [torch.tensor([1, 2, 3]), torch.tensor([4, 5])],

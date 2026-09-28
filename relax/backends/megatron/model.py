@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import torch
 from megatron.core import mpu
@@ -57,6 +58,7 @@ from relax.utils.training.ppo_utils import (
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function
+from .megatron_patch.gdn_cu_seqlens_cache import install_gdn_cu_seqlens_cache
 from .model_provider import (
     get_model_provider_func,
     validate_mtp_only_trainable_params,
@@ -205,9 +207,29 @@ def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dic
             forward_kwargs["loss_mask"] = batch["unsplit_mtp_loss_mask"]
         return
 
-    # Use the packed text-model labels. Qwen3/VL bridge forwards may receive
-    # unsplit input_ids, then convert them to this layout internally.
-    forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
+    # MCore rolls supplied labels once for each MTP depth. They must already
+    # be next-token labels here: the MTP layer also rolls input_ids once to
+    # condition on the next token. Use MCore's packed/CP-aware roll so the
+    # shift stops at each document boundary and crosses CP ranks correctly.
+    from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+    cp_group = None
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        dynamic_cp_size = batch.get("dynamic_cp_size")
+        cp_group = (
+            mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
+            if dynamic_cp_size is not None
+            else mpu.get_context_parallel_group()
+        )
+    mtp_labels, _ = roll_tensor(
+        batch["tokens"],
+        shifts=-1,
+        dims=-1,
+        cp_group=cp_group,
+        packed_seq_params=batch.get("packed_seq_params"),
+        return_sum=False,
+    )
+    forward_kwargs["mtp_kwargs"] = {"mtp_labels": mtp_labels}
     if forward_kwargs.get("loss_mask") is None:
         forward_kwargs["loss_mask"] = batch["full_loss_masks"]
 
@@ -308,6 +330,14 @@ def _is_vit_parameter_name(name: str) -> bool:
 def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) -> dict:
     """Build Megatron optimizer overrides, including the optional MS-Swift-
     style ViT LR group."""
+    if Envs.RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS:
+        if getattr(args, "vit_lr", None) is not None:
+            raise ValueError("RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS is incompatible with --vit-lr")
+        # The standard Megatron groups set wd_mult=0 for biases and 1-D
+        # parameters. The strict AutoModel parity baseline used a single AdamW
+        # group, so every trainable parameter received the configured decay.
+        return {}
+
     config_overrides = get_standard_config_overrides(config)
     vit_lr = getattr(args, "vit_lr", None)
     if vit_lr is None:
@@ -408,6 +438,8 @@ def setup_model_and_optimizer(
         if active_replays:
             RoutingReplay.all_routing_replays = active_replays
 
+    install_gdn_cu_seqlens_cache()
+
     if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
         # Global, idempotent GatedDeltaNet patch — apply whenever CP is active
         # (dynamic CP, or static context_parallel_size > 1), incl. weight-only
@@ -500,6 +532,64 @@ def _gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group):
     from .cp_utils import gdn_cp_gather_full
 
     return gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group)
+
+
+def _relax_gdn_cp_config_assert() -> None:
+    """Relax Megatron's GDN config gate ``linear_num_{key,value}_heads %
+    (tp*cp) == 0`` down to ``% tp`` so high-CP GDN configs (e.g. TP2/CP16)
+    finalize.
+
+    Megatron's ``TransformerConfig.__post_init__`` enforces the *native* cp2hp
+    (split-sequence -> split-head) divisibility ``heads % (tp * cp)``.
+    ``_patch_gdn_for_dynamic_cp`` replaces that forward with an all-gather + duplicated
+    scan whose weights stay **TP-only** (``qk_dim_local_tp = qk_dim // tp``, etc.), so
+    only ``heads % tp`` is actually required. Without relaxing this config gate, TP2/CP16
+    (16 % 32 != 0) aborts at config finalize (``get_model_provider_func`` -> ``finalize``
+    -> ``__post_init__``) *before* the forward patch is installed.
+
+    Only intervenes when the native check would reject but the relaxed ``% tp`` check
+    passes: it temporarily scales the two GDN head counts by ``cp`` (which preserves
+    ``value % key`` and makes ``heads % (tp*cp)`` hold), runs the original
+    ``__post_init__``, then restores them. Those head counts are validation-only in
+    ``__post_init__`` (no stored value is derived from them -- verified against Megatron
+    core), and ``GatedDeltaNet.__init__`` reads the restored config later, so nothing
+    downstream sees the temporary values. Idempotent; monkey-patch only (no upstream
+    edit), matching ``_patch_gdn_for_dynamic_cp``.
+    """
+    try:
+        from megatron.core.transformer.transformer_config import TransformerConfig
+    except ImportError:
+        return
+
+    if getattr(TransformerConfig, "_gdn_cp_relaxed", False):
+        return
+
+    _orig_post_init = TransformerConfig.__post_init__
+
+    def _relaxed_post_init(self, *post_init_args, **post_init_kwargs):
+        if getattr(self, "experimental_attention_variant", None) in ("gdn", "gated_delta_net"):
+            tp = self.tensor_model_parallel_size
+            cp = self.context_parallel_size
+            key = self.linear_num_key_heads or 0
+            val = self.linear_num_value_heads or 0
+            native_bad = cp > 1 and ((key % (tp * cp)) != 0 or (val % (tp * cp)) != 0)
+            relaxed_ok = tp > 0 and (key % tp) == 0 and (val % tp) == 0
+            if native_bad and relaxed_ok:
+                # key%tp==0 => (key*cp)%(tp*cp)==0, and (val*cp)%(key*cp)==(val%key) so the
+                # value%key assert is preserved. Restored in `finally` before anything else
+                # (incl. GatedDeltaNet.__init__) reads the config.
+                self.linear_num_key_heads = key * cp
+                self.linear_num_value_heads = val * cp
+                try:
+                    _orig_post_init(self, *post_init_args, **post_init_kwargs)
+                finally:
+                    self.linear_num_key_heads = key
+                    self.linear_num_value_heads = val
+                return
+        _orig_post_init(self, *post_init_args, **post_init_kwargs)
+
+    TransformerConfig.__post_init__ = _relaxed_post_init
+    TransformerConfig._gdn_cp_relaxed = True
 
 
 def _patch_gdn_for_dynamic_cp() -> None:
@@ -602,25 +692,22 @@ def _patch_gdn_for_dynamic_cp() -> None:
             cu_seqlens=cu_seqlens,
         )
 
-        # Reuse the module's own prep (split/l2norm/GQA-expand) with CP disabled so
-        # its internal `// cp_size_headwise` becomes a no-op. Wrap in the dynamo-disable
-        # guard added by docker/patch/megatron/20260506-85bced0ae.patch (Qwen3.6 GDN
-        # torch.compile failure); calling _prepare_qkv_for_gated_delta_rule directly
-        # would re-trigger that compile failure.
-        with torch._dynamo.config.patch(disable=True):
-            query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-                qkv, gate, beta, alpha, batch, seq_len, cp_size_headwise=1
-            )
-
-        # g/beta from the full (un-CP-sliced) A_log / dt_bias.
-        g, beta = self._compute_g_and_beta(self.A_log, self.dt_bias, alpha, beta)
+        # Reuse the pinned GDN prep (split/l2norm/GQA-expand/gates) with CP disabled
+        # so its internal `// self.cp_size` keeps the full TP-local head dimensions.
+        # The prep is JIT-decorated; avoid tracing this all-gather fallback into it.
+        _saved_cp = self.cp_size
+        self.cp_size = 1
+        try:
+            with torch._dynamo.config.patch(disable=True):
+                kernel_inputs = self._prepare_input_for_gated_delta_rule(
+                    qkv, gate, self.A_log, self.dt_bias, batch, seq_len, beta, alpha
+                )
+        finally:
+            self.cp_size = _saved_cp
+        gate = kernel_inputs.pop("gate")
 
         core_attn_out, _ = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
+            **kernel_inputs,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
@@ -761,6 +848,7 @@ def forward_only(
                 "max_seq_lens",
                 "classification_labels",
                 "sample_weights",
+                "pre_shifted_labels",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -839,6 +927,7 @@ def forward_only(
             with_entropy=args.use_rollout_entropy,
             max_seq_lens=batch.get("max_seq_lens", None),
             padded_total_lengths=batch.get("padded_total_lengths", None),
+            pre_shifted_labels=batch.get("unconcat_pre_shifted_labels"),
             loss_masks=batch.get("loss_masks", None),
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
@@ -960,6 +1049,19 @@ def forward_only(
     return rollout_data
 
 
+def _finalize_model_grads_with_cache_release(*args: Any, **kwargs: Any) -> None:
+    """Release inactive CUDA blocks before Megatron's gradient collectives."""
+    reserved_before = torch.cuda.memory_reserved()
+    torch.cuda.empty_cache()
+    logger.info(
+        "Qwen48 pre-grad-sync cache release: reserved_before=%s reserved_after=%s allocated=%s",
+        reserved_before,
+        torch.cuda.memory_reserved(),
+        torch.cuda.memory_allocated(),
+    )
+    finalize_model_grads(*args, **kwargs)
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -1008,6 +1110,28 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
+    precision_metrics = os.environ.get("QWEN38_PRECISION_METRICS") == "1"
+    precision_lr_before = None
+    if precision_metrics:
+        if (
+            args.loss_type != "sft"
+            or not args.calculate_per_token_loss
+            or not args.enable_mtp_training
+            or not args.sft_chunked_logits
+            or args.mtp_num_layers != 1
+            or getattr(args, "mtp_loss_normalization", None) != "main_update_tokens"
+        ):
+            raise ValueError(
+                "QWEN38_PRECISION_METRICS requires chunked per-token SFT with one update-normalized MTP layer"
+            )
+        precision_lr_before = float(optimizer.param_groups[0]["lr"])
+        if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+
+            tracker = MTPLossLoggingHelper.tracker
+            tracker["qwen38_precision_mtp_nll_sum"] = torch.zeros((), device="cuda", dtype=torch.float64)
+            tracker["qwen38_precision_mtp_tokens"] = torch.zeros((), device="cuda", dtype=torch.float64)
+
     main_loss_has_tokens = False
 
     def forward_step(
@@ -1054,6 +1178,7 @@ def train_one_step(
                     "rollout_log_probs",
                     "max_seq_lens",
                     "sample_index_mask_sums",
+                    "pre_shifted_labels",
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1220,6 +1345,15 @@ def train_one_step(
     # clip, and inner step in one shot — avoids the double prepare_grads/unscale and
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
     # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
+    if os.environ.get("QWEN48_EMPTY_CACHE_BEFORE_OPT") == "1":
+        reserved_before = torch.cuda.memory_reserved()
+        torch.cuda.empty_cache()
+        logger.info(
+            "Qwen48 pre-optimizer cache release: reserved_before=%s reserved_after=%s allocated=%s",
+            reserved_before,
+            torch.cuda.memory_reserved(),
+            torch.cuda.memory_allocated(),
+        )
     valid_step = True
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
@@ -1277,6 +1411,21 @@ def train_one_step(
         assert len(keys) + 1 == values.numel()
         torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
+        precision_mtp_values = None
+        if precision_metrics:
+            from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+
+            tracker = MTPLossLoggingHelper.tracker
+            precision_mtp_values = torch.stack(
+                [
+                    tracker.pop("qwen38_precision_mtp_nll_sum"),
+                    tracker.pop("qwen38_precision_mtp_tokens"),
+                ]
+            )
+            torch.distributed.all_reduce(
+                precision_mtp_values, group=mpu.get_data_parallel_group(with_context_parallel=True)
+            )
+
         loss_reduced = {}
         values = values.tolist()
         is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
@@ -1306,6 +1455,18 @@ def train_one_step(
             # Per-token and sequence-classification metrics use the all-reduced
             # effective count. RL sample-mean metrics use the step's logical GBS.
             loss_reduced[key] = value / num_samples_or_tokens
+        if precision_mtp_values is not None:
+            main_nll_sum = values[keys.index("loss") + 1]
+            mtp_nll_sum, mtp_tokens = precision_mtp_values.tolist()
+            mtp_scale = args.mtp_loss_scaling_factor / args.mtp_num_layers
+            loss_reduced.update(
+                precision_main_nll_sum=main_nll_sum,
+                precision_main_tokens=num_samples_or_tokens,
+                precision_mtp_nll_sum=mtp_nll_sum,
+                precision_mtp_tokens=mtp_tokens,
+                precision_total_loss=(main_nll_sum + mtp_scale * mtp_nll_sum) / num_samples_or_tokens,
+                precision_lr_before=precision_lr_before,
+            )
         capture_hooks.end_step_for()
         return loss_reduced, grad_norm
     capture_hooks.end_step_for()
@@ -1371,7 +1532,11 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    config.finalize_model_grads_func = (
+        _finalize_model_grads_with_cache_release
+        if os.environ.get("QWEN48_EMPTY_CACHE_BEFORE_GRAD_SYNC") == "1"
+        else finalize_model_grads
+    )
 
     pre_hook_enabled = False
     param_sync_func = None
@@ -1485,15 +1650,14 @@ def train(
 
             mtp_loss_scale = 1 / num_microbatches[step_id]
             tracker = MTPLossLoggingHelper.tracker
-            # mcore >= 0.19 renamed the tracker payload: the per-microbatch
-            # accumulator is now "loss_sums" (plus "num_tokens" in per-token mode)
-            # instead of "values", and the cross-rank reduction moved into
-            # MTPLossLoggingHelper.reduce_loss_in_tracker(), which repopulates
-            # "values" and handles both normalization modes. Older mcore exposes
-            # "values" directly with no such helper, so reduce by hand there.
+            # Newer MCore accumulates normalized losses in "loss_values" and
+            # reduces that tensor in place via reduce_metrics_in_tracker(). Older
+            # variants use either reduce_loss_in_tracker() or expose "values"
+            # directly, so retain both compatibility fallbacks.
             # Mirrors upstream MTPLossLoggingHelper.track_mtp_metrics.
-            mtp_losses = None
-            reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
+            reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_metrics_in_tracker", None)
+            if reduce_in_tracker is None:
+                reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
             if reduce_in_tracker is not None:
                 reduce_in_tracker()
             elif "values" in tracker:
@@ -1502,8 +1666,8 @@ def train(
                     torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
                 if tracker.get("avg_group") is not None:
                     torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
-            # "values" is the reduced payload on both old and new mcore;
-            # "loss_values" is the compatibility slot used by older helpers.
+            # The legacy payload is "values"; the renamed metrics tracker uses
+            # "loss_values".
             mtp_values = tracker.get("values")
             if mtp_values is None:
                 mtp_values = tracker.get("loss_values")
@@ -1511,7 +1675,10 @@ def train(
                 scaled = mtp_values * mtp_loss_scale
                 mtp_loss_per_depth = scaled.flatten().tolist()
                 mtp_losses = sum(mtp_loss_per_depth)
-                MTPLossLoggingHelper.clean_loss_in_tracker()
+                clean_tracker = getattr(MTPLossLoggingHelper, "clean_metrics_in_tracker", None)
+                if clean_tracker is None:
+                    clean_tracker = MTPLossLoggingHelper.clean_loss_in_tracker
+                clean_tracker()
 
                 # CI check: verify MTP loss is within expected bounds
                 if args.ci_test:

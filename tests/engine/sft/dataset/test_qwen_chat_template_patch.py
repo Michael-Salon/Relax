@@ -3,12 +3,14 @@
 """Qwen history-thinking template patch tests."""
 
 import hashlib
+import json
+import os
 import re
 
 import pytest
 import torch
 
-from relax.engine.sft.dataset.chat_template import render_to_text, render_with_loss_mask
+from relax.engine.sft.dataset.chat_template import _to_chat_messages, render_to_text, render_with_loss_mask
 from relax.engine.sft.dataset.qwen_chat_template_patch import (
     _QWEN38_PRESERVE_HISTORY_GATE,
     _QWEN_ASSISTANT_TOOL_CALL,
@@ -19,9 +21,12 @@ from relax.engine.sft.dataset.qwen_chat_template_patch import (
     _QWEN_TOOL_CALL_SEPARATOR_PATCH,
     _QWEN_TOOL_CALL_WITH_SEPARATOR,
     _QWEN_UNCONDITIONAL_REASONING_GATE,
+    is_qwen38_chat_template,
+    split_qwen38_leading_thinking,
     try_patch_qwen_chat_template,
 )
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
+from relax.engine.sft.dataset.streaming import SFTStreamingDataset
 
 
 _QWEN35_TEMPLATE = "\n".join(("template-start", _QWEN_HISTORY_GATE, "template-end"))
@@ -248,6 +253,25 @@ class _FakeQwenHistoryTokenizer:
         return result
 
 
+class _FakeQwen38Tokenizer(_FakeQwenHistoryTokenizer):
+    chat_template = _QWEN38_TEMPLATE
+
+    def apply_chat_template(self, messages, *, tools=None, tokenize=True, **kwargs):  # noqa: ARG002
+        self.last_template = kwargs.get("chat_template", self.chat_template)
+        last_user = max((i for i, message in enumerate(messages) if message["role"] == "user"), default=-1)
+        rendered = ""
+        for index, message in enumerate(messages):
+            role = message["role"]
+            content = message["content"]
+            if role == "assistant" and (kwargs.get("preserve_thinking") is not False or index > last_user):
+                reasoning = (message.get("reasoning_content") or "").strip()
+                content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+            rendered += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+        if not tokenize:
+            return rendered
+        return self._tokenize(rendered)[0]
+
+
 def _learned_text(input_ids: torch.Tensor, loss_mask: torch.Tensor) -> str:
     return "".join(chr(int(char)) for char, mask in zip(input_ids.tolist(), loss_mask.tolist()) if mask == 1)
 
@@ -292,6 +316,211 @@ def test_qwen38_preserve_gate_explicit_false_disables_auto_preserve():
     assert result is not None
     assert not result.changed
     assert result.kwargs["preserve_thinking"] is False
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("answer", None),
+        ("<think>\n\n</think>\n\nanswer", ("", "answer")),
+        ("<think>\nreason\n</think>\n\nanswer", ("reason", "answer")),
+        ("<think>\nfirst\nsecond\n</think>\n\nanswer", ("first\nsecond", "answer")),
+        ("<think>\nreason\n</think>\n\nThe token </think> closes it.", ("reason", "The token </think> closes it.")),
+    ],
+)
+def test_qwen38_split_leading_think_preserves_answer(content, expected):
+    assert split_qwen38_leading_thinking(content) == expected
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<think>unfinished",
+        " \n<think>\n\n</think>\n\nanswer",
+        "<think>reason</think>answer",
+        "<think>\nreason\n</think>answer",
+        "<think>\n<think>nested\n</think>\n\nanswer",
+        "<think>\n\n</think>\n\n<think>\n\n</think>\n\nanswer",
+    ],
+)
+def test_qwen38_split_leading_think_rejects_unknown_format(content):
+    with pytest.raises(ValueError, match="unrecognized leading"):
+        split_qwen38_leading_thinking(content)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_reason"),
+    [
+        ("answer", ""),
+        ("<think>\n\n</think>\n\nanswer", ""),
+        ("<think>\nreason\n</think>\n\nanswer", "reason"),
+    ],
+)
+def test_qwen38_native_scaffold_and_loss_are_not_duplicated(content, expected_reason):
+    tokenizer = _FakeQwen38Tokenizer()
+    sample = CanonicalSample(
+        messages=[CanonicalMessage("user", "query", False), CanonicalMessage("assistant", content, True)],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    kwargs = {"enable_thinking": False, "add_non_thinking_prefix": True, "preserve_thinking": False}
+    rendered = render_to_text(sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs)
+    input_ids, loss_mask = render_with_loss_mask(
+        sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs, ignore_empty_think=True
+    )
+    learned = _learned_text(input_ids, loss_mask)
+
+    assert is_qwen38_chat_template(tokenizer.chat_template)
+    assert rendered.count("<think>") == rendered.count("</think>") == 1
+    assert f"<think>\n{expected_reason}\n</think>\n\nanswer" in rendered
+    assert learned == (f"<think>\n{expected_reason}\n</think>\n\n" if expected_reason else "") + "answer<|im_end|>\n"
+    assert sample.messages[1].content == content
+    assert sample.messages[1].reasoning_content is None
+    assert tokenizer.chat_template == _QWEN38_TEMPLATE
+
+
+@pytest.mark.parametrize("preserve_thinking", [False, True])
+def test_qwen38_multiturn_preserve_policy_and_last_round_loss(preserve_thinking):
+    tokenizer = _FakeQwen38Tokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "q1", False),
+            CanonicalMessage("assistant", "<think>\nold reason\n</think>\n\na1", True),
+            CanonicalMessage("user", "q2", False),
+            CanonicalMessage("assistant", "<think>\n\n</think>\n\na2", True),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    kwargs = {"preserve_thinking": preserve_thinking, "add_non_thinking_prefix": True}
+    rendered = render_to_text(sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs, last_turn_only=True)
+    input_ids, loss_mask = render_with_loss_mask(
+        sample,
+        tokenizer=tokenizer,
+        apply_chat_template_kwargs=kwargs,
+        last_turn_only=True,
+        ignore_empty_think=True,
+    )
+
+    assert ("old reason" in rendered) == preserve_thinking
+    assert rendered.count("<think>") == (2 if preserve_thinking else 1)
+    assert _learned_text(input_ids, loss_mask) == "a2<|im_end|>\n"
+
+
+def test_qwen38_rejects_conflicting_structured_and_embedded_reasoning():
+    tokenizer = _FakeQwen38Tokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "query", False),
+            CanonicalMessage("assistant", "<think>\nraw\n</think>\n\nanswer", True, reasoning_content="structured"),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    with pytest.raises(ValueError, match="both reasoning_content"):
+        render_to_text(sample, tokenizer=tokenizer)
+
+
+@pytest.mark.parametrize("reasoning", ["", "reason"])
+def test_qwen38_dataset_text_item_normalizes_leading_think(tmp_path, reasoning):
+    path = tmp_path / "messages.jsonl"
+    content = f"<think>\n{reasoning}\n</think>\n\nanswer"
+    path.write_text(
+        json.dumps({"messages": [{"role": "user", "content": "query"}, {"role": "assistant", "content": content}]})
+        + "\n"
+    )
+    dataset = SFTStreamingDataset(
+        str(path),
+        tokenizer=_FakeQwen38Tokenizer(),
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        prefetch_max_cached=0,
+    )
+    sample = dataset.get_canonical_sample(0)
+    assert sample.messages[1].content == [{"type": "text", "text": content}]
+
+    messages = _to_chat_messages(sample, normalize_qwen38_reasoning=True)
+    assert messages[1]["reasoning_content"] == reasoning
+    assert messages[1]["content"] == [{"type": "text", "text": "answer"}]
+    assert sample.messages[1].content == [{"type": "text", "text": content}]
+
+
+def test_qwen38_real_tokenizer_dataset_text_item_loss(tmp_path):
+    tokenizer_dir = os.environ.get("QWEN38_TEST_TOKENIZER_DIR")
+    if not tokenizer_dir:
+        pytest.skip("set QWEN38_TEST_TOKENIZER_DIR to the local 8L tokenizer for this integration test")
+    from transformers import AutoTokenizer
+
+    path = tmp_path / "messages.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "query"},
+                    {"role": "assistant", "content": "<think>\n\n</think>\n\nanswer"},
+                ]
+            }
+        )
+        + "\n"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True, local_files_only=True)
+    dataset = SFTStreamingDataset(
+        str(path),
+        tokenizer=tokenizer,
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        apply_chat_template_kwargs={"enable_thinking": False},
+        loss_ignore_empty_think=True,
+        prefetch_max_cached=0,
+    )
+    processed = dataset._process_one(0)
+    assert processed is not None
+    rendered = tokenizer.decode(processed.tokens, skip_special_tokens=False)
+    learned = tokenizer.decode(processed.tokens[processed.loss_mask.bool()], skip_special_tokens=False)
+    assert rendered.count("<think>") == rendered.count("</think>") == 1
+    assert learned == "answer<|im_end|>\n"
+
+
+def test_qwen38_real_tokenizer_empty_and_nonempty_think_loss():
+    tokenizer_dir = os.environ.get("QWEN38_TEST_TOKENIZER_DIR")
+    if not tokenizer_dir:
+        pytest.skip("set QWEN38_TEST_TOKENIZER_DIR to the local 8L tokenizer for this integration test")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True, local_files_only=True)
+    kwargs = {"enable_thinking": False, "add_non_thinking_prefix": True, "preserve_thinking": False}
+    for reasoning, answer, expected_learned in [
+        ("", "answer", "answer<|im_end|>\n"),
+        ("reason", "answer", "<think>\nreason\n</think>\n\nanswer<|im_end|>\n"),
+        ("", "The token </think> closes it.", "The token </think> closes it.<|im_end|>\n"),
+    ]:
+        sample = CanonicalSample(
+            messages=[
+                CanonicalMessage("user", "query", False),
+                CanonicalMessage("assistant", f"<think>\n{reasoning}\n</think>\n\n{answer}", True),
+            ],
+            metadata={"source_dataset": "x", "row_index": 0},
+        )
+        rendered = render_to_text(sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs)
+        input_ids, loss_mask = render_with_loss_mask(
+            sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs, ignore_empty_think=True
+        )
+        assert rendered.count("<think>") == 1
+        assert tokenizer.decode(input_ids[loss_mask.bool()], skip_special_tokens=False) == expected_learned
+
+
+@pytest.mark.parametrize("template", [_QWEN35_TEMPLATE, _QWEN36_TEMPLATE, _QWEN38_TEMPLATE])
+@pytest.mark.parametrize("reasoning, expected_preserve", [("", False), ("  \n", False), ("reason", True)])
+def test_qwen_structured_historical_reasoning_only_auto_preserves_nonempty(template, reasoning, expected_preserve):
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "q1", False),
+            CanonicalMessage("assistant", "a1", True, reasoning_content=reasoning),
+            CanonicalMessage("user", "q2", False),
+            CanonicalMessage("assistant", "a2", True),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    result = try_patch_qwen_chat_template(sample, template, {})
+    assert result is not None
+    assert (result.kwargs.get("preserve_thinking") is True) == expected_preserve
 
 
 def test_qwen35_unconditional_reasoning_gate_gets_history_policy(monkeypatch):

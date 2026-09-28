@@ -8,6 +8,7 @@ import time
 from argparse import Namespace
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
+from threading import Event
 from typing import Any, List
 
 import ray
@@ -270,6 +271,42 @@ def _agree_sft_train_prefetch_result(
     return prefetched_fetch
 
 
+def _fetch_sft_train_payload_until_ready(
+    *,
+    stop_event: Event,
+    timeout_s: float,
+    tq_client: Any,
+    data_fields: list[str],
+    batch_size: int,
+    partition_id: str,
+    task_name: str,
+    sampling_config: dict[str, Any],
+    batch_index: int,
+) -> tuple[list, float]:
+    """Poll one SFT partition on CPU; timeout bounds empty-result waits, not
+    RPC calls."""
+    started = time.monotonic()
+    deadline = started + timeout_s
+    while True:
+        if stop_event.is_set():
+            raise RuntimeError(f"SFT train-data prefetch cancelled for {partition_id}.")
+        payload, _ = fetch_data_from_transfer_queue(
+            tq_client=tq_client,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=batch_index,
+        )
+        if payload[0] is not None and payload[1].size > 0:
+            return payload, time.monotonic() - started
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"SFT train-data prefetch timed out waiting for {partition_id}.")
+        stop_event.wait(min(0.5, remaining))
+
+
 class _SFTPrepackedDeviceIterator:
     """Two-slot H2D pipeline over fully packed pinned-CPU micro-batches.
 
@@ -375,6 +412,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self._sft_train_prefetch_executor: ThreadPoolExecutor | None = None
         self._sft_train_prefetch: Future[tuple[list, float]] | None = None
         self._sft_train_prefetch_rollout_id: int | None = None
+        self._sft_train_prefetch_stop: Event | None = None
         if is_sft_mode(self.args) and getattr(self.args, "sft_train_data_prefetch", False):
             self._sft_train_prefetch_executor = ThreadPoolExecutor(
                 max_workers=1,
@@ -2973,8 +3011,13 @@ class MegatronTrainRayActor(TrainRayActor):
             "task_name": task_name,
         }
         self._sft_train_prefetch_rollout_id = next_rollout_id
+        self._sft_train_prefetch_stop = Event()
+        tq_timeout_min = float(getattr(self.args, "sft_tq_timeout_minutes", None) or 30)
+        collective_timeout_min = float(getattr(self.args, "distributed_timeout_minutes", None) or 30)
         self._sft_train_prefetch = self._sft_train_prefetch_executor.submit(
-            fetch_data_from_transfer_queue,
+            _fetch_sft_train_payload_until_ready,
+            stop_event=self._sft_train_prefetch_stop,
+            timeout_s=min(tq_timeout_min, 0.8 * collective_timeout_min) * 60,
             tq_client=self.data_system_client,
             data_fields=data_fields,
             batch_size=batch_size,
@@ -2993,13 +3036,17 @@ class MegatronTrainRayActor(TrainRayActor):
             return None
         future = self._sft_train_prefetch
         prefetched_rollout_id = self._sft_train_prefetch_rollout_id
+        stop_event = getattr(self, "_sft_train_prefetch_stop", None)
         self._sft_train_prefetch = None
         self._sft_train_prefetch_rollout_id = None
+        self._sft_train_prefetch_stop = None
         prefetched_fetch = None
         local_error: BaseException | None = None
         fatal = False
 
         if future is not None and prefetched_rollout_id != rollout_id:
+            if stop_event is not None:
+                stop_event.set()
             logger.warning(
                 "Discarding stale SFT train-data prefetch: prefetched rollout_id=%s, requested=%s.",
                 prefetched_rollout_id,
@@ -3032,9 +3079,13 @@ class MegatronTrainRayActor(TrainRayActor):
         """Release the optional raw-prefetch slot and executor once."""
         future = self._sft_train_prefetch
         executor = self._sft_train_prefetch_executor
+        stop_event = getattr(self, "_sft_train_prefetch_stop", None)
         self._sft_train_prefetch = None
         self._sft_train_prefetch_rollout_id = None
+        self._sft_train_prefetch_stop = None
         self._sft_train_prefetch_executor = None
+        if stop_event is not None:
+            stop_event.set()
         if future is not None:
             future.cancel()
         if executor is not None:

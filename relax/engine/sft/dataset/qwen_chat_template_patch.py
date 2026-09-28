@@ -112,6 +112,28 @@ _QWEN_TOOL_CALL_SEPARATOR_PATCH = """{%- if reasoning_content|trim %}
                         {%- else %}
                             {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}
                         {%- endif %}"""
+_QWEN38_LEADING_THINK_RE = re.compile(r"\A<think>\n(.*?)\n</think>\n\n(.*)\Z", re.DOTALL)
+
+
+def is_qwen38_chat_template(template: str | None) -> bool:
+    """Recognize the native Qwen3.8 history gate, not older Qwen templates."""
+    return isinstance(template, str) and template.count(_QWEN38_PRESERVE_HISTORY_GATE) == 1
+
+
+def split_qwen38_leading_thinking(content: str) -> tuple[str, str] | None:
+    """Move an already rendered Qwen3.8 think block into message fields.
+
+    The model template supplies this scaffold itself. Keep the answer bytes
+    intact and reject unknown leading formats so they cannot be trained twice.
+    """
+    if not content.startswith("<think>"):
+        if content.lstrip().startswith("<think>"):
+            raise ValueError("Qwen3.8 assistant content has an unrecognized leading <think> block")
+        return None
+    match = _QWEN38_LEADING_THINK_RE.fullmatch(content)
+    if match is None or "<think>" in match.group(1) or match.group(2).lstrip().startswith("<think>"):
+        raise ValueError("Qwen3.8 assistant content has an unrecognized leading <think> block")
+    return match.group(1), match.group(2)
 
 
 def _content_as_text(content: str | list[dict] | None) -> str:
@@ -148,7 +170,10 @@ def _has_learnable_historical_thinking(sample: CanonicalSample) -> bool:
         index < last_user_index
         and message.role == "assistant"
         and message.learn
-        and "</think>" in _content_as_text(message.content)
+        and (
+            bool(message.reasoning_content and message.reasoning_content.strip())
+            or "</think>" in _content_as_text(message.content)
+        )
         for index, message in enumerate(sample.messages)
     )
 

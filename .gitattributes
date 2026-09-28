@@ -1,0 +1,2 @@
+# Generated upstream diffs must keep their exact bytes for SHA256 checks.
+docker/patch/qwen38-flash-next-ple-offload-20260924/*.patch -whitespace

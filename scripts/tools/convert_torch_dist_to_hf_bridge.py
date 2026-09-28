@@ -284,6 +284,38 @@ def _export_checkpoint(bridge, input_dir, output_dir, strict):
         )
 
 
+def _copy_origin_tokenizer_processor_assets(origin_hf_dir, output_dir, *, copy_config=False):
+    """Keep the original token and image preprocessing contracts on HF
+    export."""
+    import shutil
+
+    asset_names = (
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.json",
+        "merges.txt",
+    )
+    if copy_config:
+        asset_names += (
+            "preprocessor_config.json",
+            "processor_config.json",
+            "generation_config.json",
+            "chat_template.jinja",
+        )
+
+    for fname in asset_names:
+        src = os.path.join(origin_hf_dir, fname)
+        dst = os.path.join(output_dir, fname)
+        if os.path.isfile(src):
+            shutil.copyfile(src, dst)
+            print(f"[convert] copied {fname} from origin (preprocessing compatibility)")
+        elif copy_config and fname == "processor_config.json" and os.path.isfile(dst):
+            # A bridge-generated processor config can override the native image
+            # processor even when the original checkpoint has no such file.
+            os.remove(dst)
+            print(f"[convert] removed bridge-generated {fname} absent from origin")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Convert torch distributed checkpoint to HuggingFace format using Megatron Bridge"
@@ -470,12 +502,7 @@ if __name__ == "__main__":
             json.dump(cfg, f, indent=2, ensure_ascii=False)
         print(f"[convert] post-processed {cfg_path} for transformers 4.x compatibility")
 
-    for fname in ("tokenizer_config.json", "vocab.json", "merges.txt"):
-        src = os.path.join(args.origin_hf_dir, fname)
-        dst = os.path.join(args.output_dir, fname)
-        if os.path.isfile(src):
-            shutil.copyfile(src, dst)
-            print(f"[convert] copied {fname} from origin (tokenizer-compatibility)")
+    _copy_origin_tokenizer_processor_assets(args.origin_hf_dir, args.output_dir, copy_config=args.copy_config)
 
     if fp8_writer is not None:
         print(

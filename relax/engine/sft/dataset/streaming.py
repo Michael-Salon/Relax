@@ -32,6 +32,21 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 _LEARN_ROLES = {"assistant", "function_call"}
+_LOSS_FIELD_SEEN = False
+
+
+def _resolve_learn_flag(raw: dict, role: str) -> bool:
+    """Use Relax's learn flag, then ms-swift's loss flag, then the role
+    default."""
+    if "learn" in raw:
+        return bool(raw["learn"])
+    if "loss" in raw:
+        global _LOSS_FIELD_SEEN
+        if not _LOSS_FIELD_SEEN:
+            _LOSS_FIELD_SEEN = True
+            logger.info("SFT message loss flags select supervised turns when learn flags are absent.")
+        return bool(raw["loss"])
+    return role in _LEARN_ROLES
 
 
 class SFTMultimodalContractError(ValueError):
@@ -48,6 +63,7 @@ class ProcessedSample:
     multimodal_train_inputs: dict[str, Any] | None
     source_idx: int
     classification_label: torch.Tensor | None = None
+    pre_shifted_labels: torch.Tensor | None = None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -182,7 +198,7 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
             raise ValueError(f"SFT message missing role: {raw}")
         if "content" not in raw:
             raise ValueError(f"SFT message missing content: {raw}")
-        learn = bool(raw.get("learn", role in _LEARN_ROLES))
+        learn = _resolve_learn_flag(raw, role)
         has_learn = has_learn or learn
         messages.append(
             CanonicalMessage(
@@ -1055,8 +1071,20 @@ def pack_samples_for_tq(
     total_lengths = [s.total_length for s in samples]
     has_mm = force_multimodal_field or any(s.multimodal_train_inputs is not None for s in samples)
     is_classification = any(s.classification_label is not None for s in samples)
+    has_pre_shifted_labels = any(s.pre_shifted_labels is not None for s in samples)
     if is_classification and not all(s.classification_label is not None for s in samples):
         raise ValueError("classification labels must be present for every sample in a batch")
+    if has_pre_shifted_labels and not all(s.pre_shifted_labels is not None for s in samples):
+        raise ValueError("pre-shifted labels must be present for every sample in a batch")
+    if is_classification and has_pre_shifted_labels:
+        raise ValueError("pre-shifted labels cannot be combined with classification labels")
+    if has_pre_shifted_labels:
+        for sample in samples:
+            assert sample.pre_shifted_labels is not None
+            if sample.pre_shifted_labels.shape != sample.tokens.shape or sample.loss_mask.shape != sample.tokens.shape:
+                raise ValueError("pre-shifted labels, tokens, and loss mask must have identical shapes")
+            if not torch.equal(sample.loss_mask.bool(), sample.pre_shifted_labels.ne(-100)):
+                raise ValueError("pre-shifted loss mask must equal labels != -100")
     batch = {
         "tokens": tokens,
         "loss_masks": loss_masks,
@@ -1068,6 +1096,8 @@ def pack_samples_for_tq(
     }
     if is_classification:
         batch["classification_labels"] = [s.classification_label.tolist() for s in samples]
+    if has_pre_shifted_labels:
+        batch["pre_shifted_labels"] = [s.pre_shifted_labels for s in samples]
     if sample_weights is not None:
         if len(sample_weights) != len(samples):
             raise ValueError(f"sample_weights length must match samples: {len(sample_weights)} != {len(samples)}")

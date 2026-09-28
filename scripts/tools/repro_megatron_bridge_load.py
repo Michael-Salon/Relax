@@ -7,6 +7,7 @@ This intentionally follows the train actor initialization path up to:
 initialize_model_and_optimizer -> load_checkpoint -> bridge.load_hf_weights.
 """
 
+import json
 import os
 import time
 from datetime import datetime, timedelta
@@ -45,6 +46,43 @@ def _write_cuda_memory_snapshot(rank_dir: Path, name: str) -> None:
         return
     torch.cuda.synchronize()
     _write_text(rank_dir / f"{name}_memory_summary.txt", torch.cuda.memory_summary())
+
+
+def _write_load_audit(args, model, optimizer, elapsed: float) -> None:
+    audit_dir = os.environ.get("RELAX_REPRO_AUDIT_DIR")
+    if not audit_dir:
+        return
+    path = Path(audit_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    parameters = []
+    for chunk_index, chunk in enumerate(model):
+        for name, parameter in chunk.named_parameters():
+            parameters.append(
+                {
+                    "chunk": chunk_index,
+                    "name": name,
+                    "shape": list(parameter.shape),
+                    "dtype": str(parameter.dtype),
+                    "numel": parameter.numel(),
+                    "requires_grad": parameter.requires_grad,
+                }
+            )
+    payload = {
+        "rank": args.rank,
+        "world_size": args.world_size,
+        "tp": args.tensor_model_parallel_size,
+        "pp": args.pipeline_model_parallel_size,
+        "cp": args.context_parallel_size,
+        "ep": args.expert_model_parallel_size,
+        "only_load_weight": args.only_load_weight,
+        "optimizer_present": optimizer is not None,
+        "elapsed_seconds": elapsed,
+        "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None,
+        "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved() if torch.cuda.is_available() else None,
+        "parameters": parameters,
+    }
+    target = path / f"rank_{args.rank:03d}.json"
+    _write_text(target, json.dumps(payload, sort_keys=True) + "\n")
 
 
 def _export_profile_artifact(rank_dir: Path, name: str, export_fn) -> None:
@@ -253,6 +291,8 @@ def main() -> None:
     model, optimizer, opt_param_scheduler, iteration = initialize_model_and_optimizer(args, role)
     dist.barrier(group=get_gloo_group())
     elapsed = time.perf_counter() - start
+
+    _write_load_audit(args, model, optimizer, elapsed)
 
     if args.rank == 0:
         logger.info(

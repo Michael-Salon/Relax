@@ -17,6 +17,22 @@ from relax.utils.memory_utils import print_memory
 logger = get_logger(__name__)
 
 
+def _profile_this_rank() -> bool:
+    """Limit optional profiler capture to the requested global ranks."""
+    selected = os.environ.get("RELAX_PROFILE_RANKS")
+    if not selected:
+        return True
+    try:
+        ranks = {int(value.strip()) for value in selected.split(",") if value.strip()}
+    except ValueError as exc:
+        raise ValueError("RELAX_PROFILE_RANKS must be a comma-separated list of global ranks") from exc
+    if not ranks or any(rank < 0 for rank in ranks):
+        raise ValueError("RELAX_PROFILE_RANKS must contain non-negative global ranks")
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("RELAX_PROFILE_RANKS requires an initialized distributed process group")
+    return torch.distributed.get_rank() in ranks
+
+
 def _get_rank_tag() -> str:
     """Build a rank tag string like ``rank0_dp0_tp0_pp0`` from Megatron mpu."""
     global_rank = torch.distributed.get_rank()
@@ -35,11 +51,11 @@ class TrainProfiler:
         self._torch_profiler_overall = None
         self._memory_profiler_overall = None
 
-        if args.use_pytorch_profiler and ("train_overall" in args.profile_target):
+        if args.use_pytorch_profiler and ("train_overall" in args.profile_target) and _profile_this_rank():
             self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
             logger.info(f"PyTorch profiler for overall training is enabled, dump dir: {_get_train_trace_dir(args)}")
 
-        if args.record_memory_history and ("train_overall" in args.profile_target):
+        if args.record_memory_history and ("train_overall" in args.profile_target) and _profile_this_rank():
             self._memory_profiler_overall = _BaseMemoryProfiler.create(args)
             self._memory_profiler_overall.start()
             logger.info(f"Memory profiler for overall training is enabled, dump dir: {args.memory_snapshot_dir}")
@@ -67,7 +83,7 @@ class TrainProfiler:
 
 
 def _profile_simple_loop(iterator, args, name):
-    if not (args.use_pytorch_profiler and (name in args.profile_target)):
+    if not (args.use_pytorch_profiler and (name in args.profile_target) and _profile_this_rank()):
         yield from iterator
         return
 

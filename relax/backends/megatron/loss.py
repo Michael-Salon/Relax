@@ -50,6 +50,7 @@ def get_responses(
     unconcat_tokens: list[torch.Tensor],
     total_lengths: list[int],
     response_lengths: list[int],
+    pre_shifted_labels: list[torch.Tensor] | None = None,
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
     apply_temperature: bool = True,
@@ -99,6 +100,10 @@ def get_responses(
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     end = 0
     seq_start = 0
+    if pre_shifted_labels is not None and cp_size != 1:
+        raise ValueError("pre-shifted SFT labels currently require context_parallel_size=1")
+    if pre_shifted_labels is not None and len(pre_shifted_labels) != len(unconcat_tokens):
+        raise ValueError("pre-shifted labels must contain one tensor per sample")
     for i, (tokens, total_length, response_length) in enumerate(
         zip(unconcat_tokens, total_lengths, response_lengths, strict=False)
     ):
@@ -113,10 +118,17 @@ def get_responses(
                 end += total_length
                 start = end - response_length
             if response_length == total_length:
-                # SFT branch; see relax.utils.sft_utils.compute_sft_response_chunk.
-                from relax.utils.sft_utils import compute_sft_response_chunk
+                if pre_shifted_labels is not None:
+                    labels = pre_shifted_labels[i]
+                    if labels.numel() != total_length:
+                        raise ValueError("pre-shifted labels must match total_length")
+                    logits_chunk = logits[start:end]
+                    tokens_chunk = labels.masked_fill(labels.eq(-100), 0)
+                else:
+                    # SFT branch; see relax.utils.sft_utils.compute_sft_response_chunk.
+                    from relax.utils.sft_utils import compute_sft_response_chunk
 
-                logits_chunk, tokens_chunk = compute_sft_response_chunk(logits, tokens, start, end)
+                    logits_chunk, tokens_chunk = compute_sft_response_chunk(logits, tokens, start, end)
             else:
                 logits_chunk = logits[start - 1 : end - 1]
                 tokens_chunk = tokens[-response_length:]
@@ -291,6 +303,7 @@ def get_log_probs_and_entropy(
     unconcat_tokens: list[torch.Tensor],
     total_lengths: list[int],
     response_lengths: list[int],
+    pre_shifted_labels: list[torch.Tensor] | None = None,
     with_entropy: bool = False,
     with_topk: bool = False,
     topk_k: int | None = None,
@@ -379,6 +392,7 @@ def get_log_probs_and_entropy(
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
             response_lengths=response_lengths,
+            pre_shifted_labels=pre_shifted_labels,
             max_seq_lens=max_seq_lens,
             padded_total_lengths=padded_total_lengths,
             dynamic_cp_size=dynamic_cp_size,
@@ -1224,6 +1238,7 @@ def sft_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
+        pre_shifted_labels=batch.get("unconcat_pre_shifted_labels"),
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),
@@ -1359,6 +1374,7 @@ def sft_loss_function_chunked(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=batch["total_lengths"],
         response_lengths=batch["response_lengths"],
+        pre_shifted_labels=batch.get("unconcat_pre_shifted_labels"),
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),

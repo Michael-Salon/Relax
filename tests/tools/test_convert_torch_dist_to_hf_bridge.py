@@ -101,3 +101,25 @@ def test_adapter_coverage_uses_persistent_sharded_tensor_key():
         }
     )
     assert converter._adapter_checkpoint_keys_from_model([chunk]) == {persistent_key}
+
+
+def test_export_preserves_origin_tokenizer_and_image_preprocessor(tmp_path):
+    origin = tmp_path / "origin"
+    output = tmp_path / "output"
+    origin.mkdir()
+    output.mkdir()
+    for name in ("tokenizer.json", "preprocessor_config.json", "generation_config.json"):
+        (origin / name).write_bytes(b"original")
+        (output / name).write_bytes(b"regenerated")
+    (output / "processor_config.json").write_bytes(b"bridge-generated")
+
+    converter._copy_origin_tokenizer_processor_assets(origin, output, copy_config=True)
+
+    for name in ("tokenizer.json", "preprocessor_config.json", "generation_config.json"):
+        assert (output / name).read_bytes() == (origin / name).read_bytes()
+    assert not (output / "processor_config.json").exists()
+
+    (origin / "processor_config.json").write_bytes(b"original")
+    (output / "processor_config.json").write_bytes(b"bridge-generated")
+    converter._copy_origin_tokenizer_processor_assets(origin, output, copy_config=True)
+    assert (output / "processor_config.json").read_bytes() == b"original"

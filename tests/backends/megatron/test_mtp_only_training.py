@@ -32,6 +32,12 @@ class _ConfiguredModule(torch.nn.Module):
         self.config = config
 
 
+class _ConfiguredMtpBlock(torch.nn.Linear):
+    def __init__(self, config=None):
+        super().__init__(4, 4)
+        self.config = config or Namespace()
+
+
 MTP_PATCH = Path(__file__).resolve().parents[3] / "docker" / "patch" / "latest" / "megatron.patch"
 
 
@@ -131,16 +137,34 @@ def test_backbone_detach_preserves_gradients_between_mtp_layers():
         (("embedding", "backbone", "lm-head"), (True, True, True)),
     ],
 )
-def test_configure_mtp_detach_paths_updates_all_module_configs(detach_paths, expected):
+def test_configure_mtp_detach_paths_updates_all_module_configs(monkeypatch, detach_paths, expected):
     shared_config = Namespace()
     model = _ConfiguredModule(shared_config)
     model.child = _ConfiguredModule(Namespace())
     model.shared_child = _ConfiguredModule(shared_config)
+    model.mtp = _ConfiguredMtpBlock(shared_config)
+    monkeypatch.setattr(model_provider_mod, "MultiTokenPredictionBlock", _ConfiguredMtpBlock)
 
     configure_mtp_detach_paths(Namespace(mtp_detach_paths=detach_paths), model)
 
-    for config in (model.config, model.child.config, model.shared_child.config):
+    for config in (model.config, model.child.config, model.shared_child.config, model.mtp.config):
         assert (config.mtp_detach_embedding, config.mtp_detach_backbone, config.mtp_detach_lm_head) == expected
+        assert config.mtp_detach_heads is all(expected)
+
+    for param in model.mtp.parameters():
+        assert (getattr(param, "grad_norm_group", None) == "mtp") is all(expected)
+
+
+def test_configure_mtp_detach_paths_removes_stale_mtp_grad_norm_group(monkeypatch):
+    model = _ConfiguredModule(Namespace())
+    model.mtp = _ConfiguredMtpBlock()
+    monkeypatch.setattr(model_provider_mod, "MultiTokenPredictionBlock", _ConfiguredMtpBlock)
+    for param in model.mtp.parameters():
+        param.grad_norm_group = "mtp"
+
+    configure_mtp_detach_paths(Namespace(mtp_detach_paths=("backbone", "lm-head")), model)
+
+    assert all(not hasattr(param, "grad_norm_group") for param in model.mtp.parameters())
 
 
 def test_configure_mtp_detach_paths_defaults_to_all_detached():

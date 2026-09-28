@@ -78,6 +78,21 @@ def test_vit_lr_is_opt_in():
     assert not any(key.with_name_predicate and "max_lr" in override for key, override in overrides.items())
 
 
+def test_weight_decay_all_params_disables_standard_no_decay_groups(monkeypatch):
+    monkeypatch.setenv("RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS", "1")
+
+    config = OptimizerConfig(lr=4.5e-5, min_lr=1e-6)
+    assert _build_optimizer_config_overrides(SimpleNamespace(vit_lr=None), config) == {}
+
+
+def test_weight_decay_all_params_rejects_vit_lr(monkeypatch):
+    monkeypatch.setenv("RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS", "1")
+
+    config = OptimizerConfig(lr=4.5e-5, min_lr=1e-6)
+    with pytest.raises(ValueError, match="incompatible with --vit-lr"):
+        _build_optimizer_config_overrides(SimpleNamespace(vit_lr=1e-5), config)
+
+
 def test_vit_lr_rejects_nonzero_warmup_init():
     config = OptimizerConfig(lr=4.5e-5, min_lr=1e-6)
 

@@ -1,0 +1,2356 @@
+diff --git a/src/megatron/bridge/models/__init__.py b/src/megatron/bridge/models/__init__.py
+index 5ccb39396..afc844b22 100644
+--- a/src/megatron/bridge/models/__init__.py
++++ b/src/megatron/bridge/models/__init__.py
+@@ -156,6 +156,7 @@ from megatron.bridge.models.olmoe import (
+     OlMoEBridge,
+     OlMoEModelProvider,
+ )
++from megatron.bridge.models.qwen import Qwen4ExpBridge, Qwen4ExpTextBridge
+ from megatron.bridge.models.qwen3_asr import (
+     Qwen3ASRBridge,
+     Qwen3ASRModel,
+@@ -293,6 +294,8 @@ __all__ = [
+     "Qwen3VLBridge",
+     "Qwen3VLMoEBridge",
+     "Qwen35VLBridge",
++    "Qwen4ExpBridge",
++    "Qwen4ExpTextBridge",
+     "Qwen35TokenClassificationBridge",
+     "Qwen35TokenClassificationModelProvider",
+     "Qwen35VLModelProvider",
+diff --git a/src/megatron/bridge/models/qwen/__init__.py b/src/megatron/bridge/models/qwen/__init__.py
+index cf091ab08..b9885530d 100644
+--- a/src/megatron/bridge/models/qwen/__init__.py
++++ b/src/megatron/bridge/models/qwen/__init__.py
+@@ -16,4 +16,6 @@ from megatron.bridge.models.qwen.qwen2_bridge import Qwen2Bridge  # noqa: F401
+ from megatron.bridge.models.qwen.qwen3_bridge import Qwen3Bridge  # noqa: F401
+ from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge  # noqa: F401
+ from megatron.bridge.models.qwen.qwen3_next_bridge import Qwen3NextBridge  # noqa: F401
++from megatron.bridge.models.qwen.qwen4_exp_bridge import Qwen4ExpBridge, Qwen4ExpTextBridge  # noqa: F401
++from megatron.bridge.models.qwen.qwen4_exp_vl_bridge import Qwen4ExpVLBridge  # noqa: F401
+ from megatron.bridge.models.qwen.qwen35_bridge import Qwen35Bridge, Qwen35MoEBridge  # noqa: F401
+diff --git a/src/megatron/bridge/models/qwen/qwen4_exp_bridge.py b/src/megatron/bridge/models/qwen/qwen4_exp_bridge.py
+new file mode 100644
+index 000000000..fcfbfbacf
+--- /dev/null
++++ b/src/megatron/bridge/models/qwen/qwen4_exp_bridge.py
+@@ -0,0 +1,626 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Megatron Bridge for Qwen4-Exp (Qwen3.8-Flash-Next).
++
++Qwen4-Exp is the Qwen3.5-MoE hybrid (3 x Gated DeltaNet + 1 x gated attention per block, 512-expert
++MoE with a gated shared expert) extended with
++
++* **Gated Residual** hyper connections: 4 residual streams, every sub-layer reads a sigmoid-gated
++  mean of the per-stream RMS-normalized streams and writes back with per-stream scalar gates; the
++  block output is a learned gated mix of the streams (``hyper_connection_mixer``);
++* **Qwen Sparse Attention** on the full-attention layers: an MQA indexer scores mean-pooled key
++  blocks and every query attends to its top ``indexer_budget`` tokens plus its own block;
++* a **Per-Layer (hashed n-gram) Embedding** injected before one decoder layer, whose 51B-parameter
++  table is stored as ``split_ngram_parts`` checkpoint shards;
++* a 1-layer MTP head (not bridged: MTP is disabled for the Megatron model).
++
++The checkpoint is a VL model (``Qwen4ExpForConditionalGeneration``); only the language model is
++bridged, to :class:`~megatron.core.models.gpt.gpt_model.GPTModel`. The vision tower is not built.
++"""
++
++import os
++import re
++from typing import Callable, Dict, Mapping, Optional
++
++import torch
++import torch.nn as nn
++from megatron.core import parallel_state
++from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
++    get_transformer_block_with_experimental_attention_variant_spec,
++)
++from megatron.core.models.gpt.gpt_model import GPTModel
++
++from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
++from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
++from megatron.bridge.models.conversion.param_mapping import (
++    AutoMapping,
++    GatedMLPMapping,
++    GDNConv1dMapping,
++    GDNLinearMappingSeparate,
++    MegatronParamMapping,
++    QKVMapping,
++    ReplicatedMapping,
++    RMSNorm2ZeroCenteredRMSNormMapping,
++)
++from megatron.bridge.models.conversion.utils import moe_experts_stored_packed
++from megatron.bridge.models.gpt_provider import GPTModelProvider
++from megatron.bridge.models.qwen.qwen35_bridge import _moe_routed_expert_mappings
++
++
++_LAYER_TYPE_TO_LINEAR = {"linear_attention": 1, "full_attention": 0, "qwen_sparse_attention": 0}
++_PLE_SHARD_RE = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight$")
++
++
++def linear_attention_pattern_from_hf(text_config) -> list[int]:
++    """Per-layer pattern (1 = Gated DeltaNet, 0 = (sparse) softmax attention).
++
++    ``Qwen4ExpTextConfig.__post_init__`` rewrites the checkpoint's ``full_attention`` entries to
++    ``qwen_sparse_attention``, which the generic Qwen3-Next helper does not know about.
++    """
++    layer_types = getattr(text_config, "layer_types", None)
++    if isinstance(layer_types, list) and layer_types:
++        try:
++            return [_LAYER_TYPE_TO_LINEAR[layer_type] for layer_type in layer_types]
++        except KeyError as error:
++            raise ValueError(f"Unsupported Qwen4-Exp layer type: {error.args[0]}") from error
++    interval = getattr(text_config, "full_attention_interval", 4)
++    return [0 if (i + 1) % interval == 0 else 1 for i in range(text_config.num_hidden_layers)]
++
++
++def get_qwen4_exp_text_config(hf_config):
++    """The language-model config of a unified (VL) or text-only Qwen4-Exp config."""
++    return hf_config.text_config if getattr(hf_config, "text_config", None) is not None else hf_config
++
++
++def get_qwen4_exp_hf_lm_prefix(hf_config) -> str:
++    """``model.language_model.`` for the VL checkpoint layout, ``model.`` for text-only ones."""
++    return "model.language_model." if getattr(hf_config, "text_config", None) is not None else "model."
++
++
++def ple_local_rows_from_shards(
++    load_shard: Callable[[int], torch.Tensor],
++    num_shards: int,
++    num_rows_total: int,
++    shard_rows: int,
++    tp_rank: int,
++    tp_size: int,
++) -> torch.Tensor:
++    """Assemble one tensor-parallel rank's rows of a row-sharded HF table.
++
++    Rank ``r`` owns rows ``[r * rows_per_rank, (r + 1) * rows_per_rank)`` (the
++    ``VocabParallelEmbedding`` layout); only the HF shards overlapping that range are loaded.
++
++    Args:
++        load_shard: ``callable(shard_index) -> Tensor`` loading one HF shard.
++        num_shards: Number of HF shards.
++        num_rows_total: Total (padded) row count of the table.
++        shard_rows: Rows per HF shard (all but possibly the last shard).
++        tp_rank / tp_size: Tensor-parallel coordinates.
++    """
++    if num_rows_total % tp_size != 0:
++        raise ValueError(f"PLE table rows ({num_rows_total}) are not divisible by tp_size={tp_size}")
++    rows_per_rank = num_rows_total // tp_size
++    start, end = tp_rank * rows_per_rank, (tp_rank + 1) * rows_per_rank
++    pieces = []
++    for shard_index in range(start // shard_rows, min(num_shards, (end - 1) // shard_rows + 1)):
++        shard = load_shard(shard_index)
++        shard_start = shard_index * shard_rows
++        lo = max(start, shard_start) - shard_start
++        hi = min(end, shard_start + shard.shape[0]) - shard_start
++        pieces.append(shard[lo:hi])
++    rows = torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
++    if rows.shape[0] != rows_per_rank:
++        raise ValueError(f"PLE shards cover {rows.shape[0]} rows for TP rank {tp_rank}, expected {rows_per_rank}")
++    return rows
++
++
++class PLENGramEmbeddingMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
++    """Vocab-parallel PLE n-gram table <-> ``split_ngram_parts`` HF shards.
++
++    The HF checkpoint stores the table row-split into ``ngram_embedding.shard_<i>.weight`` tensors
++    (concatenated along dim 0 they form the padded table). Megatron keeps the table as a
++    :class:`~megatron.core.tensor_parallel.layers.VocabParallelEmbedding`, i.e. row-sharded across
++    the tensor-parallel group.
++
++    Import is rank-local: :meth:`Qwen4ExpBridge.maybe_modify_loaded_hf_weight` loads only the shards
++    that overlap this rank's row range (:func:`ple_local_rows_from_shards`), so the 51B-parameter
++    table is never materialized in full on any rank. Export streams the table back out one HF shard
++    at a time (:class:`_PLEShardExport`): each shard is assembled from the TP ranks' rows when the
++    export loop reaches it, so peak memory is one shard (~0.8 GB for Qwen3.8-Flash-Next), not the
++    ~100 GB table.
++    """
++
++    def __init__(self, megatron_param: str, hf_param: str | Dict[str, str], num_shards: Optional[int] = None):
++        """
++        Args:
++            megatron_param: Megatron parameter name pattern.
++            hf_param: Either the HF shard-name pattern with a ``{}`` placeholder for the shard index
++                (then ``num_shards`` is required), or the already expanded ``{"shard_<i>": name}``
++                dict (the form :meth:`resolve` re-instantiates the mapping with).
++            num_shards: Number of HF shards when ``hf_param`` is a pattern.
++        """
++        if isinstance(hf_param, str):
++            if num_shards is None:
++                raise ValueError("num_shards is required when hf_param is a shard-name pattern")
++            hf_param = {f"shard_{i}": hf_param.format(i) for i in range(num_shards)}
++        super().__init__(megatron_param, hf_param)
++        self.num_shards = len(hf_param)
++
++    def hf_to_megatron(self, hf_weights: Dict[str, torch.Tensor], megatron_module: nn.Module) -> torch.Tensor:
++        """Return this rank's rows.
++
++        ``hf_weights`` is either the rank-local ``{"local_rows": Tensor}`` produced by
++        :meth:`Qwen4ExpBridge.maybe_modify_loaded_hf_weight`, or (fallback) the full shard dict.
++        """
++        if "local_rows" in hf_weights:
++            rows = hf_weights["local_rows"]
++        else:
++            shards = [hf_weights[f"shard_{i}"] for i in range(self.num_shards)]
++            total = sum(s.shape[0] for s in shards)
++            rows = ple_local_rows_from_shards(
++                lambda i: shards[i], self.num_shards, total, shards[0].shape[0], self.tp_rank, self.tp_size
++            )
++        target = megatron_module.weight
++        if hasattr(megatron_module, "_table_loaded"):
++            megatron_module._table_loaded = True
++        return rows.to(device=target.device, dtype=target.dtype)
++
++    def megatron_to_hf(
++        self, megatron_weights: Optional[torch.Tensor], megatron_module: Optional[nn.Module]
++    ) -> Mapping[str, torch.Tensor]:
++        """Re-split the TP row shards into the checkpoint's shard layout, one shard at a time.
++
++        Returns a lazy mapping: shard ``i`` is assembled (a tensor-parallel collective) when the
++        export loop iterates to it, so all TP ranks must consume the shards in the same order --
++        which the export does, and which a ``dict(...)`` / ``.items()`` traversal preserves.
++        """
++        if os.environ.get("QWEN48_PLE_CPU_OFFLOAD") == "1":
++            return _PLEHostShardExport(self, megatron_weights)
++        megatron_weights = self.broadcast_from_pp_rank(megatron_weights, cache_key=str(self.megatron_param))
++        if megatron_weights is None:
++            return {}
++        return _PLEShardExport(self, megatron_weights)
++
++    def gather_shard(self, local_rows: torch.Tensor, shard_index: int) -> torch.Tensor:
++        """Assemble HF shard ``shard_index`` from the tensor-parallel row shards.
++
++        Rank ``r`` owns rows ``[r * rows_per_rank, (r + 1) * rows_per_rank)``; each rank writes
++        its overlap with the shard's row range into a zero buffer and the buffers are summed over
++        the TP group (exact: every row has exactly one owner).
++        """
++        rows_per_rank = local_rows.shape[0]
++        total_rows = rows_per_rank * self.tp_size
++        shard_rows = -(-total_rows // self.num_shards)
++        start = shard_index * shard_rows
++        end = min(total_rows, start + shard_rows)
++        if self.tp_size == 1:
++            return local_rows[start:end]
++        rank_start = self.tp_rank * rows_per_rank
++        lo = max(start, rank_start)
++        hi = min(end, rank_start + rows_per_rank)
++        shard = torch.zeros(end - start, local_rows.shape[1], dtype=local_rows.dtype, device=local_rows.device)
++        if hi > lo:
++            shard[lo - start : hi - start] = local_rows[lo - rank_start : hi - rank_start]
++        torch.distributed.all_reduce(shard, group=self.tp_group)
++        return shard
++
++
++class _PLEShardExport(Mapping[str, torch.Tensor]):
++    """Lazy ``{hf_shard_name: tensor}`` view over a TP-sharded PLE table (see ``gather_shard``)."""
++
++    def __init__(self, mapping: PLENGramEmbeddingMapping, local_rows: torch.Tensor):
++        self._mapping = mapping
++        self._local_rows = local_rows
++        self._names = [mapping.hf_param[f"shard_{i}"] for i in range(mapping.num_shards)]
++        self._index = {name: i for i, name in enumerate(self._names)}
++
++    def __getitem__(self, name: str) -> torch.Tensor:
++        return self._mapping.gather_shard(self._local_rows, self._index[name])
++
++    def __iter__(self):
++        return iter(self._names)
++
++    def __len__(self) -> int:
++        return len(self._names)
++
++
++class _PLEHostShardExport(Mapping[str, torch.Tensor]):
++    """Stream pinned TP rows through bounded GPU PP/TP collectives for HF export."""
++
++    def __init__(self, mapping: PLENGramEmbeddingMapping, local_rows: Optional[torch.Tensor]):
++        self._mapping = mapping
++        self._local_rows = local_rows
++        self._names = [mapping.hf_param[f"shard_{i}"] for i in range(mapping.num_shards)]
++        self._index = {name: i for i, name in enumerate(self._names)}
++        if mapping.pp_size > 1:
++            specs = [None] * mapping.pp_size
++            spec = (tuple(local_rows.shape), local_rows.dtype) if local_rows is not None else None
++            torch.distributed.all_gather_object(specs, spec, group=mapping.pp_group)
++            owners = [(rank, item) for rank, item in enumerate(specs) if item is not None]
++            if len(owners) != 1:
++                raise ValueError(f"Expected one PP owner for host PLE table, got {owners}")
++            self._source_rank, (self._shape, self._dtype) = owners[0]
++            self._source_global_rank = torch.distributed.get_global_rank(mapping.pp_group, self._source_rank)
++        else:
++            if local_rows is None:
++                raise ValueError("Missing local PLE table for HF export")
++            self._shape, self._dtype = tuple(local_rows.shape), local_rows.dtype
++            self._source_global_rank = None
++
++    def __getitem__(self, name: str) -> torch.Tensor:
++        mapping = self._mapping
++        shard_index = self._index[name]
++        rows_per_rank, width = self._shape
++        total = rows_per_rank * mapping.tp_size
++        shard_rows = -(-total // mapping.num_shards)
++        start, end = shard_index * shard_rows, min(total, (shard_index + 1) * shard_rows)
++        result = torch.empty(end - start, width, dtype=self._dtype, device="cpu")
++        chunk_rows = max(1, (16 << 20) // (width * result.element_size()))
++        rank_start = mapping.tp_rank * rows_per_rank
++        device = torch.device("cuda", torch.cuda.current_device())
++        for chunk_start in range(start, end, chunk_rows):
++            chunk_end = min(end, chunk_start + chunk_rows)
++            local = torch.zeros(chunk_end - chunk_start, width, dtype=self._dtype, device=device)
++            lo, hi = max(chunk_start, rank_start), min(chunk_end, rank_start + rows_per_rank)
++            if hi > lo and self._local_rows is not None:
++                local[lo - chunk_start : hi - chunk_start].copy_(
++                    self._local_rows[lo - rank_start : hi - rank_start], non_blocking=False
++                )
++            if mapping.pp_size > 1:
++                torch.distributed.broadcast(local, src=self._source_global_rank, group=mapping.pp_group)
++            if mapping.tp_size > 1:
++                torch.distributed.all_reduce(local, group=mapping.tp_group)
++            result[chunk_start - start : chunk_end - start].copy_(local)
++        return result
++
++    def __iter__(self):
++        return iter(self._names)
++
++    def __len__(self) -> int:
++        return len(self._names)
++
++
++@MegatronModelBridge.register_bridge(
++    source="Qwen4ExpForConditionalGeneration", target=GPTModel, model_type="qwen4_exp"
++)
++class Qwen4ExpBridge(MegatronModelBridge):
++    """Megatron Bridge for the Qwen4-Exp language model (Qwen3.8-Flash-Next).
++
++    Bridges ``Qwen4ExpForConditionalGeneration`` (vision + language) and
++    ``Qwen4ExpForCausalLM`` (text-only) checkpoints to ``GPTModel``. Only the language model is
++    converted; callers that load the VL checkpoint must not need the vision tower
++    (``language_model_only``).
++
++    Example:
++        >>> from megatron.bridge import AutoBridge
++        >>> bridge = AutoBridge.from_hf_pretrained("Qwen/Qwen3.8-Flash-Next")
++        >>> provider = bridge.to_megatron_provider()
++    """
++
++    # Legacy provider construction path only (see MegatronModelBridge.MODEL_CONFIG_CLASS).
++    MODEL_CONFIG_CLASS = None
++
++    def provider_bridge(self, hf_pretrained) -> GPTModelProvider:
++        """Convert the HuggingFace Qwen4-Exp config into a GPTModelProvider."""
++        hf_config = hf_pretrained.config
++        text_config = get_qwen4_exp_text_config(hf_config)
++        rope_parameters = getattr(text_config, "rope_parameters", None) or {}
++        tie_word_embeddings = getattr(hf_config, "tie_word_embeddings", False) or getattr(
++            text_config, "tie_word_embeddings", False
++        )
++
++        provider = GPTModelProvider(
++            num_layers=text_config.num_hidden_layers,
++            hidden_size=text_config.hidden_size,
++            ffn_hidden_size=text_config.moe_intermediate_size,
++            num_attention_heads=text_config.num_attention_heads,
++            num_query_groups=text_config.num_key_value_heads,
++            kv_channels=text_config.head_dim,
++            vocab_size=text_config.vocab_size,
++            seq_length=text_config.max_position_embeddings,
++            layernorm_epsilon=text_config.rms_norm_eps,
++            init_method_std=text_config.initializer_range,
++            attention_dropout=text_config.attention_dropout,
++            hidden_dropout=0.0,
++            rotary_base=rope_parameters.get("rope_theta", 10_000_000),
++            share_embeddings_and_output_weights=tie_word_embeddings,
++        )
++
++        # --- Qwen3.5-MoE base: zero-centered RMSNorm, gated attention with QK norm, GDN hybrid ---
++        provider.activation_func = self.hf_to_megatron_activation(text_config.hidden_act)
++        provider.normalization = "RMSNorm"
++        provider.layernorm_zero_centered_gamma = True
++        provider.gated_linear_unit = True
++        provider.add_qkv_bias = getattr(text_config, "attention_bias", False)
++        provider.add_bias_linear = False
++        provider.qk_layernorm = True
++        provider.attention_output_gate = True
++        provider.experimental_attention_variant = "gdn"
++        provider.linear_attention_freq = linear_attention_pattern_from_hf(text_config)
++        provider.linear_conv_kernel_dim = text_config.linear_conv_kernel_dim
++        provider.linear_key_head_dim = text_config.linear_key_head_dim
++        provider.linear_value_head_dim = text_config.linear_value_head_dim
++        provider.linear_num_key_heads = text_config.linear_num_key_heads
++        provider.linear_num_value_heads = text_config.linear_num_value_heads
++        # Qwen4-Exp gates the GDN state output with a sigmoid instead of SiLU.
++        provider.linear_attention_output_gate_activation = getattr(text_config, "output_gate_type", None) or (
++            "silu" if text_config.hidden_act in ("silu", "swish") else text_config.hidden_act
++        )
++        provider.rotary_percent = rope_parameters.get("partial_rotary_factor", 0.25)
++
++        # --- MoE: 512 routed experts (top-k, softmax-then-topk), gated shared expert ---
++        provider.moe_ffn_hidden_size = text_config.moe_intermediate_size
++        provider.num_moe_experts = text_config.num_experts
++        provider.moe_router_topk = text_config.num_experts_per_tok
++        provider.moe_shared_expert_intermediate_size = text_config.shared_expert_intermediate_size
++        provider.moe_shared_expert_gate = True
++        provider.moe_grouped_gemm = True
++        provider.moe_router_load_balancing_type = "global_aux_loss"
++        provider.moe_aux_loss_coeff = getattr(text_config, "router_aux_loss_coef", 0.001)
++        provider.moe_router_pre_softmax = False
++        provider.moe_token_dispatcher_type = "alltoall"
++        provider.moe_permute_fusion = True
++        provider.moe_router_dtype = "fp32"
++
++        # --- Gated Residual hyper connections ---
++        provider.enable_mhc_connections = True
++        provider.mhc_variant = "gated_residual"
++        provider.mhc_num_residual_streams = text_config.hc_count
++        provider.mhc_gated_residual_rank = text_config.hc_lowrank
++
++        # --- Qwen Sparse Attention on the softmax-attention layers ---
++        if getattr(text_config, "indexer_n_heads", None) is not None:
++            provider.qsa_indexer_n_heads = text_config.indexer_n_heads
++            provider.qsa_indexer_kv_heads = text_config.indexer_kv_heads
++            provider.qsa_indexer_head_dim = text_config.indexer_head_dim
++            provider.qsa_indexer_budget = text_config.indexer_budget
++            provider.qsa_indexer_compress_ratio = text_config.indexer_compress_ratio
++
++        # --- Per-layer n-gram embedding ---
++        ple_layer_ids = list(getattr(text_config, "ple_layer_ids", None) or [])
++        if ple_layer_ids:
++            eos_token_id = text_config.eos_token_id
++            if isinstance(eos_token_id, (list, tuple)):
++                eos_token_id = eos_token_id[0]
++            provider.ple_layer_ids = ple_layer_ids
++            provider.ple_embed_dim = getattr(text_config, "ple_embed_dim", None) or text_config.hidden_size
++            provider.ple_conv_kernel_size = text_config.ple_conv_kernel_size
++            provider.ple_ngram_size = text_config.ngram_size
++            provider.ple_heads_per_ngram = text_config.heads_per_ngram
++            provider.ple_ngram_vocab_size_base = text_config.ngram_vocab_size_base
++            provider.ple_ngram_vocab_divisible_by = text_config.make_ngram_vocab_size_divisible_by
++            provider.ple_seed = text_config.seed
++            provider.ple_eos_token_id = eos_token_id
++            provider.ple_unigram_vocab_size = text_config.vocab_size
++
++        # MTP: the checkpoint carries a 1-layer MTP head; it is not built for the Megatron model.
++        provider.mtp_num_layers = None
++
++        provider.position_embedding_type = "rope"
++        provider.autocast_dtype = torch.bfloat16
++        provider.bos_token_id = getattr(text_config, "bos_token_id", None)
++        eos = getattr(text_config, "eos_token_id", None)
++        provider.eos_token_id = eos[0] if isinstance(eos, (list, tuple)) else eos
++        provider.transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec
++        provider.hetereogenous_dist_checkpoint = True
++        return provider
++
++    # ------------------------------------------------------------------ mappings
++    @staticmethod
++    def _hyper_connection_mappings(megatron_prefix: str, hf_prefix: str, with_inject: bool) -> list:
++        names = ["hc_norm.weight", "input_mix_weight_down.weight", "input_mix_weight_up.weight"]
++        if with_inject:
++            names.append("block_inject_weight.weight")
++        return [ReplicatedMapping(f"{megatron_prefix}{n}", f"{hf_prefix}{n}") for n in names]
++
++    @staticmethod
++    def get_lm_mappings(
++        hf_prefix: str, experts_packed: bool, text_config, num_ple_shards: int, megatron_prefix: str = ""
++    ) -> list:
++        """Parameter mappings of the language model.
++
++        ``megatron_prefix`` is empty for GPTModel (text-only); it is ``"language_model."``
++        when the same decoder lives inside a VL wrapper (Qwen3VLModel).
++        """
++        mp = megatron_prefix
++        simple = {
++            f"{mp}embedding.word_embeddings.weight": f"{hf_prefix}embed_tokens.weight",
++            f"{mp}output_layer.weight": "lm_head.weight",
++            # MoE router
++            f"{mp}decoder.layers.*.mlp.router.weight": f"{hf_prefix}layers.*.mlp.gate.weight",
++            # (Sparse) attention layers
++            f"{mp}decoder.layers.*.self_attention.q_layernorm.weight": f"{hf_prefix}layers.*.self_attn.q_norm.weight",
++            f"{mp}decoder.layers.*.self_attention.k_layernorm.weight": f"{hf_prefix}layers.*.self_attn.k_norm.weight",
++            f"{mp}decoder.layers.*.self_attention.linear_proj.weight": f"{hf_prefix}layers.*.self_attn.o_proj.weight",
++            # Gated DeltaNet layers
++            f"{mp}decoder.layers.*.self_attention.out_proj.weight": f"{hf_prefix}layers.*.linear_attn.out_proj.weight",
++            f"{mp}decoder.layers.*.self_attention.A_log": f"{hf_prefix}layers.*.linear_attn.A_log",
++            f"{mp}decoder.layers.*.self_attention.dt_bias": f"{hf_prefix}layers.*.linear_attn.dt_bias",
++        }
++        mappings = [AutoMapping(megatron_param=m, hf_param=h) for m, h in simple.items()]
++        AutoMapping.register_module_type("SharedExpertMLP", "column")
++        AutoMapping.register_module_type("GatedDeltaNet", "column")
++
++        mappings.extend(
++            [
++                QKVMapping(
++                    megatron_param=f"{mp}decoder.layers.*.self_attention.linear_qkv.weight",
++                    q=f"{hf_prefix}layers.*.self_attn.q_proj.weight",
++                    k=f"{hf_prefix}layers.*.self_attn.k_proj.weight",
++                    v=f"{hf_prefix}layers.*.self_attn.v_proj.weight",
++                ),
++                GDNConv1dMapping(
++                    megatron_param=f"{mp}decoder.layers.*.self_attention.conv1d.weight",
++                    hf_param=f"{hf_prefix}layers.*.linear_attn.conv1d.weight",
++                ),
++                GDNLinearMappingSeparate(
++                    megatron_param=f"{mp}decoder.layers.*.self_attention.in_proj.weight",
++                    qkv=f"{hf_prefix}layers.*.linear_attn.in_proj_qkv.weight",
++                    z=f"{hf_prefix}layers.*.linear_attn.in_proj_z.weight",
++                    b=f"{hf_prefix}layers.*.linear_attn.in_proj_b.weight",
++                    a=f"{hf_prefix}layers.*.linear_attn.in_proj_a.weight",
++                ),
++                # GDN output norm: HF stores a plain RMSNorm gain, Megatron a zero-centered one.
++                RMSNorm2ZeroCenteredRMSNormMapping(
++                    f"{mp}decoder.layers.*.self_attention.out_norm.weight",
++                    f"{hf_prefix}layers.*.linear_attn.norm.weight",
++                ),
++                *_moe_routed_expert_mappings(hf_prefix, mp, experts_packed),
++                GatedMLPMapping(
++                    megatron_param=f"{mp}decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
++                    gate=f"{hf_prefix}layers.*.mlp.shared_expert.gate_proj.weight",
++                    up=f"{hf_prefix}layers.*.mlp.shared_expert.up_proj.weight",
++                ),
++                AutoMapping(
++                    megatron_param=f"{mp}decoder.layers.*.mlp.shared_experts.linear_fc2.weight",
++                    hf_param=f"{hf_prefix}layers.*.mlp.shared_expert.down_proj.weight",
++                ),
++                ReplicatedMapping(
++                    megatron_param=f"{mp}decoder.layers.*.mlp.shared_experts.gate_weight",
++                    hf_param=f"{hf_prefix}layers.*.mlp.shared_expert_gate.weight",
++                ),
++            ]
++        )
++
++        # QSA indexer (duplicated across TP ranks).
++        if getattr(text_config, "indexer_n_heads", None) is not None:
++            for name in ("index_qk_proj.weight", "q_layernorm.weight", "k_layernorm.weight"):
++                mappings.append(
++                    ReplicatedMapping(
++                        f"{mp}decoder.layers.*.self_attention.indexer.{name}",
++                        f"{hf_prefix}layers.*.self_attn.indexer.{name}",
++                    )
++                )
++
++        # Gated Residual hyper connections (per sub-layer) and the final learned stream mixer.
++        mappings.extend(
++            Qwen4ExpBridge._hyper_connection_mappings(
++                f"{mp}decoder.layers.*.self_attention_hyper_connection.",
++                f"{hf_prefix}layers.*.attn_hyper_connection.",
++                with_inject=True,
++            )
++        )
++        mappings.extend(
++            Qwen4ExpBridge._hyper_connection_mappings(
++                f"{mp}decoder.layers.*.mlp_hyper_connection.",
++                f"{hf_prefix}layers.*.mlp_hyper_connection.",
++                with_inject=True,
++            )
++        )
++        mappings.extend(
++            Qwen4ExpBridge._hyper_connection_mappings(
++                f"{mp}decoder.final_layernorm.", f"{hf_prefix}hyper_connection_mixer.", with_inject=False
++            )
++        )
++
++        # Per-layer n-gram embedding.
++        if getattr(text_config, "ple_layer_ids", None):
++            ple_m = f"{mp}decoder.layers.*.per_layer_embedding."
++            ple_h = f"{hf_prefix}layers.*.ple."
++            for name in (
++                "key_proj.weight",
++                "value_proj.weight",
++                "norm_key.weight",
++                "norm_query.weight",
++                "norm_conv.weight",
++                "conv1d.weight",
++                # Hash layout buffers: derived from the config on both sides, stored in both
++                # checkpoint formats.
++                "ple_embedding.layer_multipliers",
++                "ple_embedding.ngram_heads_vocab_sizes",
++                "ple_embedding.ngram_heads_offsets",
++            ):
++                mappings.append(ReplicatedMapping(f"{ple_m}{name}", f"{ple_h}{name}"))
++            mappings.append(
++                PLENGramEmbeddingMapping(
++                    megatron_param=f"{ple_m}ple_embedding.ngram_embedding.weight",
++                    hf_param=f"{ple_h}ple_embedding.ngram_embedding.shard_{{}}.weight",
++                    num_shards=num_ple_shards,
++                )
++            )
++        return mappings
++
++    def _num_ple_shards(self, text_config) -> int:
++        """Number of ``shard_<i>`` tensors per PLE table, from the checkpoint keys when available."""
++        source = getattr(getattr(getattr(self, "hf_pretrained", None), "state", None), "source", None)
++        if source is not None and hasattr(source, "get_all_keys"):
++            found = {int(m.group(1)) for k in source.get_all_keys() if (m := _PLE_SHARD_RE.search(k))}
++            if found:
++                return max(found) + 1
++        return int(getattr(text_config, "split_ngram_parts", 512))
++
++    def mapping_registry(self) -> MegatronMappingRegistry:
++        """Parameter mappings of the Qwen4-Exp language model."""
++        # `hf_pretrained` is a PreTrainedCausalLM in the AutoBridge flow, but adapter-export
++        # callers may hand the bridge the bare HF config instead.
++        hf_pretrained = self.hf_pretrained
++        hf_config = hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
++        text_config = get_qwen4_exp_text_config(hf_config)
++        hf_prefix = get_qwen4_exp_hf_lm_prefix(hf_config)
++        experts_packed = moe_experts_stored_packed(self.hf_pretrained, f"{hf_prefix}layers.", default=True)
++        return MegatronMappingRegistry(
++            *self.get_lm_mappings(hf_prefix, experts_packed, text_config, self._num_ple_shards(text_config))
++        )
++
++    # ------------------------------------------------------------------ rank-local PLE import
++    def maybe_modify_loaded_hf_weight(
++        self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
++    ) -> torch.Tensor | dict[str, torch.Tensor]:
++        """Load only the PLE table shards overlapping this tensor-parallel rank's row range."""
++        if isinstance(hf_param, dict) and hf_param and all(k.startswith("shard_") for k in hf_param):
++            num_shards = len(hf_param)
++            shard_names = [hf_param[f"shard_{i}"] for i in range(num_shards)]
++            scale_name = shard_names[0].replace(".shard_0.weight", ".weight_scale")
++            scale = hf_state_dict[scale_name] if scale_name in hf_state_dict else None
++            if parallel_state.is_initialized():
++                tp_rank = parallel_state.get_tensor_model_parallel_rank()
++                tp_size = parallel_state.get_tensor_model_parallel_world_size()
++            else:
++                tp_rank, tp_size = 0, 1
++            cache: dict[int, torch.Tensor] = {0: hf_state_dict[shard_names[0]]}
++            shard_rows = cache[0].shape[0]
++            if num_shards > 1:
++                cache[num_shards - 1] = hf_state_dict[shard_names[-1]]
++                total = shard_rows * (num_shards - 1) + cache[num_shards - 1].shape[0]
++            else:
++                total = shard_rows
++
++            def load_shard(i: int) -> torch.Tensor:
++                shard = cache[i] if i in cache else hf_state_dict[shard_names[i]]
++                if shard.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
++                    if scale is None:
++                        raise ValueError(f"FP8 PLE shard requires {scale_name}")
++                    return shard.float() * scale.float()
++                return shard
++
++            rows = ple_local_rows_from_shards(load_shard, num_shards, total, shard_rows, tp_rank, tp_size)
++            return {"local_rows": rows}
++        return super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
++
++
++@MegatronModelBridge.register_bridge(source="Qwen4ExpForCausalLM", target=GPTModel, model_type="qwen4_exp_text")
++class Qwen4ExpTextBridge(Qwen4ExpBridge):
++    """Bridge for text-only Qwen4-Exp checkpoints (``Qwen4ExpForCausalLM``, ``model.`` prefix)."""
++
++
++__all__ = [
++    "PLENGramEmbeddingMapping",
++    "Qwen4ExpBridge",
++    "Qwen4ExpTextBridge",
++    "get_qwen4_exp_hf_lm_prefix",
++    "get_qwen4_exp_text_config",
++    "linear_attention_pattern_from_hf",
++    "ple_local_rows_from_shards",
++]
+diff --git a/src/megatron/bridge/models/qwen/qwen4_exp_vl_bridge.py b/src/megatron/bridge/models/qwen/qwen4_exp_vl_bridge.py
+new file mode 100644
+index 000000000..25987f265
+--- /dev/null
++++ b/src/megatron/bridge/models/qwen/qwen4_exp_vl_bridge.py
+@@ -0,0 +1,355 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Megatron Bridge for Qwen4-Exp (Qwen3.8-Flash-Next) Vision-Language models.
++
++The published checkpoint (``Qwen4ExpForConditionalGeneration``) is a VL model: a
++Qwen4-Exp language model (GDN + QSA + PLE + Gated-Residual hyper connections + MoE,
++see ``qwen4_exp_bridge``) plus a Qwen3-VL-style vision tower. This module bridges the
++*whole* model to :class:`~megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model.Qwen3VLModel`:
++
++* the language decoder reuses ``Qwen4ExpBridge.get_lm_mappings`` with the VL
++  megatron prefix (``language_model.``) — QSA indexer, PLE shards, hyper
++  connections and MoE map exactly as in the text-only bridge;
++* the vision tower reuses the Qwen3-VL mapping table
++  (``qwen35_vl_bridge._get_vision_mappings``): the fork's
++  ``Qwen4ExpVisionModel`` shares the Qwen3.5/Qwen3-VL layout (``model.visual.*``).
++
++The language model runs under mRoPE (``mrope_section`` from the HF
++``rope_parameters``), like Qwen3.5-VL. Note that the full-attention layers are QSA
++(sparse indexer attention), *not* the standard attention that
++``Qwen35VLMoEModelProvider`` patches with ``Qwen3VLSelfAttention``; the spec is
++therefore used unpatched so QSA stays intact.
++"""
++
++import torch
++from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
++from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
++    get_transformer_block_with_experimental_attention_variant_spec,
++)
++from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
++from megatron.core.transformer.hyper_connection import GatedResidualMTPHiddenNorm, GatedResidualOutputMixer
++from megatron.core.transformer.spec_utils import ModuleSpec
++from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
++
++from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
++from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
++from megatron.bridge.models.conversion.param_mapping import (
++    AutoMapping,
++    FusedExpertMapping,
++    FusedGatedExpertMapping,
++    GatedMLPMapping,
++    QKVMapping,
++    ReplicatedMapping,
++)
++from megatron.bridge.models.conversion.utils import moe_experts_stored_packed
++from megatron.bridge.models.gpt_provider import mtp_block_spec
++from megatron.bridge.models.qwen.qwen4_exp_bridge import (
++    Qwen4ExpBridge,
++    get_qwen4_exp_hf_lm_prefix,
++    get_qwen4_exp_text_config,
++    linear_attention_pattern_from_hf,
++)
++from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
++from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import _get_vision_mappings
++from megatron.bridge.models.qwen_vl.qwen35_vl_provider import Qwen35VLMoEModelProvider
++
++
++class Qwen4ExpVLMoEModelProvider(Qwen35VLMoEModelProvider):
++    """Model provider for Qwen4-Exp VL (mRoPE language model + Qwen3-VL vision tower).
++
++    All Qwen4-Exp-specific fields (PLE / QSA indexer / Gated-Residual hyper
++    connections) are populated dynamically by ``Qwen4ExpVLBridge.provider_bridge``,
++    exactly as ``Qwen4ExpBridge.provider_bridge`` populates a plain
++    ``GPTModelProvider`` for the text-only path.
++    """
++
++    def build_language_spec(self, vp_stage=None, pp_rank=None) -> TransformerBlockSubmodules | ModuleSpec:
++        """Build the Qwen4-Exp language transformer-block spec.
++
++        Unlike the Qwen3.5 VL provider, the full-attention layers are QSA, so the
++        spec is returned *without* the ``Qwen3VLSelfAttention`` patch (that patch is
++        a mRoPE shim for standard attention and would replace the QSA modules).
++        """
++        return get_transformer_block_with_experimental_attention_variant_spec(self, vp_stage=vp_stage, pp_rank=pp_rank)
++
++    def build_mtp_spec(self, vp_stage=None):
++        """Build the single QSA/MoE MTP layer with gated residual stream mixing."""
++        spec = mtp_block_spec(self, vp_stage=vp_stage)
++        if spec is not None:
++            for layer_spec in spec.layer_specs:
++                layer_spec.submodules.hnorm = GatedResidualMTPHiddenNorm
++                layer_spec.submodules.e_proj = TEColumnParallelLinear
++                layer_spec.submodules.h_proj = TEColumnParallelLinear
++                layer_spec.submodules.layer_norm = GatedResidualOutputMixer
++        return spec
++
++    def provide(self, pre_process=None, post_process=None, vp_stage=None) -> Qwen3VLModel:
++        """Provide a VL model with an MTP HybridStack on its final pipeline stage."""
++        if not self.mtp_num_layers:
++            return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
++
++        self.vision_config.torch_dtype = self.params_dtype
++        language_spec = self.build_language_spec(vp_stage=vp_stage)
++        mtp_spec = self.build_mtp_spec(vp_stage=vp_stage)
++        # The published MTP layer is one full QSA attention layer followed by MoE.
++        # Reuse the corresponding decoder spec so HC, QSA and expert dispatch agree.
++        full_attention_spec = get_transformer_block_with_experimental_attention_variant_spec(self).layer_specs[-1]
++        model = Qwen3VLModel(
++            language_transformer_config=self,
++            language_transformer_layer_spec=language_spec,
++            vision_transformer_config=self.vision_config,
++            pre_process=pre_process,
++            post_process=post_process,
++            pg_collection=self._pg_collection,
++            mtp_block_spec=mtp_spec,
++            mtp_layer_pattern="*",
++            mtp_hybrid_submodules=HybridStackSubmodules(attention_layer=full_attention_spec),
++            vp_stage=vp_stage,
++        )
++        if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
++            model.freeze(
++                freeze_language_model=self.freeze_language_model,
++                freeze_vision_model=self.freeze_vision_model,
++                freeze_vision_projection=self.freeze_vision_projection,
++            )
++        return model
++
++
++@MegatronModelBridge.register_bridge(
++    source="Qwen4ExpForConditionalGeneration",
++    target=Qwen3VLModel,
++    provider=Qwen4ExpVLMoEModelProvider,
++    model_type="qwen4_exp",
++)
++class Qwen4ExpVLBridge(Qwen4ExpBridge):
++    """Bridge the VL Qwen4-Exp checkpoint (language model + vision tower) to Qwen3VLModel."""
++
++    mimo_source_prefixes = {"language": "language_model.", "images": "vision_model."}
++
++    def provider_bridge(self, hf_pretrained) -> Qwen4ExpVLMoEModelProvider:
++        """Convert the HuggingFace Qwen4-Exp VL config into a Qwen4ExpVLMoEModelProvider."""
++        hf_config = hf_pretrained.config
++        text_config = get_qwen4_exp_text_config(hf_config)
++        rope_parameters = getattr(text_config, "rope_parameters", None) or {}
++        tie_word_embeddings = getattr(hf_config, "tie_word_embeddings", False) or getattr(
++            text_config, "tie_word_embeddings", False
++        )
++
++        provider = Qwen4ExpVLMoEModelProvider(
++            num_layers=text_config.num_hidden_layers,
++            hidden_size=text_config.hidden_size,
++            ffn_hidden_size=text_config.moe_intermediate_size,
++            num_attention_heads=text_config.num_attention_heads,
++            num_query_groups=text_config.num_key_value_heads,
++            kv_channels=text_config.head_dim,
++            vocab_size=text_config.vocab_size,
++            seq_length=text_config.max_position_embeddings,
++            layernorm_epsilon=text_config.rms_norm_eps,
++            init_method_std=text_config.initializer_range,
++            attention_dropout=text_config.attention_dropout,
++            hidden_dropout=0.0,
++            rotary_base=rope_parameters.get("rope_theta", 10_000_000),
++            share_embeddings_and_output_weights=tie_word_embeddings,
++        )
++
++        # --- Qwen3.5-MoE base: zero-centered RMSNorm, gated attention with QK norm, GDN hybrid ---
++        provider.activation_func = self.hf_to_megatron_activation(text_config.hidden_act)
++        provider.normalization = "RMSNorm"
++        provider.layernorm_zero_centered_gamma = True
++        provider.gated_linear_unit = True
++        provider.add_qkv_bias = getattr(text_config, "attention_bias", False)
++        provider.add_bias_linear = False
++        provider.qk_layernorm = True
++        provider.attention_output_gate = True
++        provider.experimental_attention_variant = "gdn"
++        provider.linear_attention_freq = linear_attention_pattern_from_hf(text_config)
++        provider.linear_conv_kernel_dim = text_config.linear_conv_kernel_dim
++        provider.linear_key_head_dim = text_config.linear_key_head_dim
++        provider.linear_value_head_dim = text_config.linear_value_head_dim
++        provider.linear_num_key_heads = text_config.linear_num_key_heads
++        provider.linear_num_value_heads = text_config.linear_num_value_heads
++        provider.linear_attention_output_gate_activation = getattr(text_config, "output_gate_type", None) or (
++            "silu" if text_config.hidden_act in ("silu", "swish") else text_config.hidden_act
++        )
++        provider.rotary_percent = rope_parameters.get("partial_rotary_factor", 0.25)
++
++        # --- MoE: 512 routed experts (top-k, softmax-then-topk), gated shared expert ---
++        provider.moe_ffn_hidden_size = text_config.moe_intermediate_size
++        provider.num_moe_experts = text_config.num_experts
++        provider.moe_router_topk = text_config.num_experts_per_tok
++        provider.moe_shared_expert_intermediate_size = text_config.shared_expert_intermediate_size
++        provider.moe_shared_expert_gate = True
++        provider.moe_grouped_gemm = True
++        provider.moe_router_load_balancing_type = "global_aux_loss"
++        provider.moe_aux_loss_coeff = getattr(text_config, "router_aux_loss_coef", 0.001)
++        provider.moe_router_pre_softmax = False
++        provider.moe_token_dispatcher_type = "alltoall"
++        provider.moe_permute_fusion = True
++        provider.moe_router_dtype = "fp32"
++
++        # --- Gated Residual hyper connections ---
++        provider.enable_mhc_connections = True
++        provider.mhc_variant = "gated_residual"
++        provider.mhc_num_residual_streams = text_config.hc_count
++        provider.mhc_gated_residual_rank = text_config.hc_lowrank
++
++        # --- Qwen Sparse Attention on the softmax-attention layers ---
++        if getattr(text_config, "indexer_n_heads", None) is not None:
++            provider.qsa_indexer_n_heads = text_config.indexer_n_heads
++            provider.qsa_indexer_kv_heads = text_config.indexer_kv_heads
++            provider.qsa_indexer_head_dim = text_config.indexer_head_dim
++            provider.qsa_indexer_budget = text_config.indexer_budget
++            provider.qsa_indexer_compress_ratio = text_config.indexer_compress_ratio
++
++        # --- Per-layer n-gram embedding ---
++        ple_layer_ids = list(getattr(text_config, "ple_layer_ids", None) or [])
++        if ple_layer_ids:
++            eos_token_id = text_config.eos_token_id
++            if isinstance(eos_token_id, (list, tuple)):
++                eos_token_id = eos_token_id[0]
++            provider.ple_layer_ids = ple_layer_ids
++            provider.ple_embed_dim = getattr(text_config, "ple_embed_dim", None) or text_config.hidden_size
++            provider.ple_conv_kernel_size = text_config.ple_conv_kernel_size
++            provider.ple_ngram_size = text_config.ngram_size
++            provider.ple_heads_per_ngram = text_config.heads_per_ngram
++            provider.ple_ngram_vocab_size_base = text_config.ngram_vocab_size_base
++            provider.ple_ngram_vocab_divisible_by = text_config.make_ngram_vocab_size_divisible_by
++            provider.ple_seed = getattr(text_config, "seed", 1234)
++            provider.ple_eos_token_id = eos_token_id
++            provider.ple_unigram_vocab_size = text_config.vocab_size
++
++        provider.mtp_num_layers = getattr(text_config, "mtp_num_hidden_layers", 0) or None
++        if provider.mtp_num_layers not in (None, 1):
++            raise ValueError(f"Qwen4-Exp VL supports one MTP layer, got {provider.mtp_num_layers}")
++        if provider.mtp_num_layers:
++            provider.mtp_loss_scaling_factor = 0.1
++
++        # --- VL overrides: mRoPE + vision tower + modality token ids ---
++        provider.position_embedding_type = "mrope"
++        provider.mrope_section = rope_parameters.get("mrope_section", [11, 11, 10])
++        provider.head_dim = getattr(text_config, "head_dim", 256)
++        provider.bos_token_id = getattr(text_config, "bos_token_id", 248045)
++        eos = getattr(text_config, "eos_token_id", 248046)
++        provider.eos_token_id = eos[0] if isinstance(eos, (list, tuple)) else eos
++        provider.vision_start_token_id = getattr(hf_config, "vision_start_token_id", 248053)
++        provider.vision_end_token_id = getattr(hf_config, "vision_end_token_id", 248054)
++        provider.image_token_id = getattr(hf_config, "image_token_id", 248056)
++        provider.video_token_id = getattr(hf_config, "video_token_id", 248057)
++
++        vision_config = hf_config.vision_config
++        vision_config.torch_dtype = torch.bfloat16
++        provider.vision_config = vision_config
++        provider.hf_text_config = text_config
++
++        provider.autocast_dtype = torch.bfloat16
++        provider.hetereogenous_dist_checkpoint = True
++        return provider
++
++    def mapping_registry(self) -> MegatronMappingRegistry:
++        """Language-model mappings (VL prefixes) + the Qwen3-VL vision mappings."""
++        hf_pretrained = self.hf_pretrained
++        hf_config = hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
++        text_config = get_qwen4_exp_text_config(hf_config)
++        hf_prefix = get_qwen4_exp_hf_lm_prefix(hf_config)  # "model.language_model." for VL
++        experts_packed = moe_experts_stored_packed(self.hf_pretrained, f"{hf_prefix}layers.", default=True)
++        mapping_list = self.get_lm_mappings(
++            hf_prefix,
++            experts_packed,
++            text_config,
++            self._num_ple_shards(text_config),
++            megatron_prefix="language_model.",
++        )
++        mapping_list.extend(_get_vision_mappings())
++        if getattr(text_config, "mtp_num_hidden_layers", 0):
++            mapping_list.extend(self._get_mtp_mappings())
++        return MegatronMappingRegistry(*mapping_list)
++
++    @staticmethod
++    def _get_mtp_mappings() -> list:
++        """Map the published QSA/MoE/HC MTP head to the MCore hybrid MTP path."""
++        mp = "language_model.mtp.layers.0."
++        hp = "mtp."
++        inner = f"{mp}mtp_model_layer.layers.0."
++        hf_inner = "mtp.layers.0."
++        mappings = [
++            AutoMapping(f"{mp}enorm.weight", f"{hp}pre_fc_norm_embedding.weight"),
++            AutoMapping(f"{mp}hnorm.weight", f"{hp}pre_fc_norm_hidden.weight"),
++            AutoMapping(f"{mp}e_proj.weight", f"{hp}fc_embedding.weight"),
++            AutoMapping(f"{mp}h_proj.weight", f"{hp}fc_hidden.weight"),
++            QKVMapping(
++                megatron_param=f"{inner}self_attention.linear_qkv.weight",
++                q=f"{hf_inner}self_attn.q_proj.weight",
++                k=f"{hf_inner}self_attn.k_proj.weight",
++                v=f"{hf_inner}self_attn.v_proj.weight",
++            ),
++        ]
++        for megatron_name, hf_name in (
++            ("mlp.router.weight", "mlp.gate.weight"),
++            ("self_attention.q_layernorm.weight", "self_attn.q_norm.weight"),
++            ("self_attention.k_layernorm.weight", "self_attn.k_norm.weight"),
++            ("self_attention.linear_proj.weight", "self_attn.o_proj.weight"),
++            ("mlp.shared_experts.linear_fc2.weight", "mlp.shared_expert.down_proj.weight"),
++        ):
++            mappings.append(AutoMapping(f"{inner}{megatron_name}", f"{hf_inner}{hf_name}"))
++        for name in ("index_qk_proj.weight", "q_layernorm.weight", "k_layernorm.weight"):
++            mappings.append(
++                ReplicatedMapping(f"{inner}self_attention.indexer.{name}", f"{hf_inner}self_attn.indexer.{name}")
++            )
++        mappings.extend(
++            Qwen4ExpBridge._hyper_connection_mappings(
++                f"{inner}self_attention_hyper_connection.", f"{hf_inner}attn_hyper_connection.", True
++            )
++        )
++        mappings.extend(
++            Qwen4ExpBridge._hyper_connection_mappings(
++                f"{inner}mlp_hyper_connection.", f"{hf_inner}mlp_hyper_connection.", True
++            )
++        )
++        mappings.extend(
++            Qwen4ExpBridge._hyper_connection_mappings(f"{mp}final_layernorm.", f"{hp}hyper_connection_mixer.", False)
++        )
++        mappings.append(
++            GatedMLPMapping(
++                megatron_param=f"{inner}mlp.shared_experts.linear_fc1.weight",
++                gate=f"{hf_inner}mlp.shared_expert.gate_proj.weight",
++                up=f"{hf_inner}mlp.shared_expert.up_proj.weight",
++            )
++        )
++        mappings.append(
++            ReplicatedMapping(f"{inner}mlp.shared_experts.gate_weight", f"{hf_inner}mlp.shared_expert_gate.weight")
++        )
++        for megatron_fc1, megatron_fc2 in (
++            ("experts.linear_fc1.weight*", "experts.linear_fc2.weight*"),
++            ("experts.local_experts.*.linear_fc1.weight", "experts.local_experts.*.linear_fc2.weight"),
++        ):
++            mappings.extend(
++                [
++                    FusedGatedExpertMapping(
++                        megatron_param=f"{inner}mlp.{megatron_fc1}",
++                        hf_param=f"{hf_inner}mlp.experts.gate_up_proj",
++                    ),
++                    FusedExpertMapping(
++                        megatron_param=f"{inner}mlp.{megatron_fc2}",
++                        hf_param=f"{hf_inner}mlp.experts.down_proj",
++                    ),
++                ]
++            )
++        return mappings
++
++
++__all__ = [
++    "Qwen4ExpVLBridge",
++    "Qwen4ExpVLMoEModelProvider",
++]
+diff --git a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+index f0d360baf..cfbaefe2a 100644
+--- a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
++++ b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+@@ -75,6 +75,24 @@ def _select_sequence(
+     return val.index_select(seq_dim, index).contiguous()
+ 
+ 
++def _select_packed_cp_if_full_sequence(
++    val: torch.Tensor | None,
++    index: torch.Tensor,
++    *,
++    full_sequence_length: int,
++) -> tuple[torch.Tensor | None, bool]:
++    """Select packed CP tokens once; an already-local tensor stays local."""
++    if val is None:
++        return None, False
++    if val.size(1) == full_sequence_length:
++        return _select_sequence(val, index, seq_dim=1), True
++    if val.size(1) == index.numel():
++        return val, False
++    raise ValueError(
++        f"Packed CP metadata expects {full_sequence_length} full or {index.numel()} local tokens, got {val.size(1)}"
++    )
++
++
+ def _get_packed_seq_padding_mask(
+     packed_seq_params: PackedSeqParams | None,
+     *,
+@@ -285,6 +303,8 @@ class Qwen3VLModel(MegatronModule):
+         add_decoder: bool = True,
+         pg_collection: ProcessGroupCollection = None,
+         mtp_block_spec: Optional[ModuleSpec] = None,
++        mtp_layer_pattern: Optional[str] = None,
++        mtp_hybrid_submodules: Optional[object] = None,
+         vp_stage: Optional[int] = None,
+     ) -> None:
+         super().__init__(config=language_transformer_config)
+@@ -397,6 +417,8 @@ class Qwen3VLModel(MegatronModule):
+                 share_embeddings_and_output_weights=language_transformer_config.share_embeddings_and_output_weights,
+                 scatter_embedding_sequence_parallel=False,
+                 mtp_block_spec=mtp_block_spec,
++                mtp_layer_pattern=mtp_layer_pattern,
++                mtp_hybrid_submodules=mtp_hybrid_submodules,
+                 vp_stage=vp_stage,
+                 pg_collection=pg_collection,
+             )
+@@ -980,10 +1002,13 @@ class Qwen3VLModel(MegatronModule):
+         return_sliced_loss_mask = False
+         if packed_seq_params is not None:
+             if packed_cp_index is not None:
+-                labels = _select_sequence(labels, packed_cp_index, seq_dim=1)
++                labels, _ = _select_packed_cp_if_full_sequence(
++                    labels, packed_cp_index, full_sequence_length=full_sequence_length
++                )
+                 if loss_mask is not None:
+-                    loss_mask = _select_sequence(loss_mask, packed_cp_index, seq_dim=1)
+-                    return_sliced_loss_mask = True
++                    loss_mask, return_sliced_loss_mask = _select_packed_cp_if_full_sequence(
++                        loss_mask, packed_cp_index, full_sequence_length=full_sequence_length
++                    )
+         elif cp_size > 1:
+             labels, _ = _split_if_full_sequence(
+                 labels,
+@@ -1001,6 +1026,27 @@ class Qwen3VLModel(MegatronModule):
+                     full_sequence_length=full_sequence_length,
+                 )
+ 
++        if kwargs.get("mtp_kwargs") is not None:
++            mtp_kwargs = dict(kwargs["mtp_kwargs"])
++            if packed_cp_index is not None:
++                mtp_kwargs["mtp_labels"], _ = _select_packed_cp_if_full_sequence(
++                    mtp_kwargs["mtp_labels"], packed_cp_index, full_sequence_length=full_sequence_length
++                )
++            elif packed_seq_params is None and cp_size > 1:
++                mtp_kwargs["mtp_labels"], _ = _split_if_full_sequence(
++                    mtp_kwargs["mtp_labels"],
++                    cp_size=cp_size,
++                    seq_dim=1,
++                    cp_rank=cp_rank,
++                    full_sequence_length=full_sequence_length,
++                )
++            if lm_input_ids is None:
++                raise ValueError("Qwen3-VL MTP requires input_ids to build its conditioning mask")
++            mtp_kwargs["mtp_input_mask"] = (lm_input_ids != self.image_token_id) & (
++                lm_input_ids != self.video_token_id
++            )
++            kwargs["mtp_kwargs"] = mtp_kwargs
++
+         output = self.language_model(
+             input_ids=lm_input_ids,
+             position_ids=position_ids,  # None in encoder
+diff --git a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+index 8fc570c6b..6602dd911 100644
+--- a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
++++ b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+@@ -78,6 +78,8 @@ class Qwen3VLGPTModel(GPTModel):
+         scatter_embedding_sequence_parallel: bool = True,
+         seq_len_interpolation_factor: Optional[float] = None,
+         mtp_block_spec: Optional[ModuleSpec] = None,
++        mtp_layer_pattern: Optional[str] = None,
++        mtp_hybrid_submodules: Optional[object] = None,
+         vp_stage: Optional[int] = None,
+         pg_collection: ProcessGroupCollection = None,
+     ) -> None:
+@@ -100,6 +102,8 @@ class Qwen3VLGPTModel(GPTModel):
+             scatter_embedding_sequence_parallel=scatter_embedding_sequence_parallel,
+             seq_len_interpolation_factor=seq_len_interpolation_factor,
+             mtp_block_spec=mtp_block_spec,
++            mtp_layer_pattern=mtp_layer_pattern,
++            mtp_hybrid_submodules=mtp_hybrid_submodules,
+             vp_stage=vp_stage,
+             pg_collection=pg_collection,
+         )
+@@ -167,6 +171,7 @@ class Qwen3VLGPTModel(GPTModel):
+         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+         output_processor: Callable[..., Tensor] | None = None,
+         output_processor_context: Any | None = None,
++        mtp_kwargs: dict[str, Tensor] | None = None,
+     ) -> Tensor:
+         """Forward function of the GPT Model This function passes the input tensors
+         through the embedding layer, and then the decoeder and finally into the post
+@@ -189,6 +194,31 @@ class Qwen3VLGPTModel(GPTModel):
+         """
+ 
+         inference_context = deprecate_inference_params(inference_context, inference_params)
++        mtp_input_mask = None
++        if mtp_kwargs is not None:
++            if labels is not None:
++                raise ValueError("Pass either main-loss labels or mtp_kwargs, not both")
++            if set(mtp_kwargs) != {"mtp_labels", "mtp_input_mask"}:
++                raise ValueError("mtp_kwargs must contain mtp_labels and mtp_input_mask")
++            labels = mtp_kwargs["mtp_labels"]
++            mtp_input_mask = mtp_kwargs["mtp_input_mask"]
++
++            # MCore needs labels to compute its auxiliary MTP loss. Relax computes
++            # the main SFT loss externally from logits, so bypass the internal CE.
++            original_output_processor = output_processor
++
++            def _mtp_logits_processor(**processor_kwargs):
++                if original_output_processor is not None:
++                    processor_kwargs["labels"] = None
++                    return original_output_processor(**processor_kwargs)
++                logits, _ = processor_kwargs["output_layer"](
++                    processor_kwargs["hidden_states"],
++                    weight=processor_kwargs["output_weight"],
++                    runtime_gather_output=processor_kwargs["runtime_gather_output"],
++                )
++                return processor_kwargs["scale_logits"](logits).transpose(0, 1).contiguous()
++
++            output_processor = _mtp_logits_processor
+ 
+         # `_preprocess` can optionally return an extra fused cos/sin buffer (for
+         # flash decode). Match the upstream GPTModel handling to avoid unpack
+@@ -212,6 +242,11 @@ class Qwen3VLGPTModel(GPTModel):
+         if len(preproc_output) > 5:
+             padding_mask = preproc_output[5]
+ 
++        # Per-layer (hashed n-gram) embeddings (Qwen4-Exp PLE) need the raw token ids
++        # prepared before the decoder runs — mirror the base GPTModel.forward.
++        if self.config.ple_layer_ids:
++            self._prepare_per_layer_embeddings(input_ids, packed_seq_params, inference_context)
++
+         # Run decoder.
+         hidden_states = self.decoder(
+             hidden_states=decoder_input,
+@@ -250,6 +285,9 @@ class Qwen3VLGPTModel(GPTModel):
+         postprocess_packed_seq_params = (
+             _get_mtp_packed_seq_params(packed_seq_params) if self.mtp_process else packed_seq_params
+         )
++        mhc_multistream = getattr(self.decoder, "_mtp_multistream", None)
++        if mhc_multistream is not None:
++            del self.decoder._mtp_multistream
+         result = self._postprocess(
+             hidden_states=hidden_states,
+             input_ids=input_ids,
+@@ -271,6 +309,8 @@ class Qwen3VLGPTModel(GPTModel):
+             inference_context=inference_context,
+             output_processor=output_processor,
+             output_processor_context=output_processor_context,
++            mtp_input_mask=mtp_input_mask,
++            **({"mhc_multistream": mhc_multistream} if mhc_multistream is not None else {}),
+         )
+ 
+         if _shadow_embedding:
+diff --git a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
+index 79390a293..52dd5589b 100644
+--- a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
++++ b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
+@@ -30,6 +30,7 @@ from megatron.core.fp8_utils import get_fp8_context
+ from megatron.core.inference.contexts import BaseInferenceContext
+ from megatron.core.packed_seq_params import PackedSeqParams
+ from megatron.core.process_groups_config import ProcessGroupCollection
++from megatron.core.transformer.hyper_connection import HyperConnectionModule
+ from megatron.core.transformer.spec_utils import ModuleSpec
+ from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
+ from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+@@ -300,6 +301,13 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
+         #   is called here to be future-proof and corner-case-proof.
+         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+ 
++        # Hyper connections (e.g. Qwen4-Exp gated residual): expand the single stream to
++        # n streams at the block start, mirroring megatron.core TransformerBlock.forward.
++        if self.config.enable_mhc_connections and self.pre_process:
++            hidden_states = HyperConnectionModule.input_expand(
++                hidden_states, self.mhc_num_residual_streams
++            )  # [s, b, C] -> [s, b, n*C]
++
+         if self.config.sequence_parallel:
+             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+         else:
+@@ -514,6 +522,14 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+         """Forward method with activation checkpointing."""
+ 
+         def custom(start: int, end: int):
++            # Pipeline schedules may prepare a later microbatch before this checkpoint
++            # replays. Keep each layer's PLE inputs with its own checkpoint closure.
++            ple_states = {}
++            for index in range(start, end):
++                ple = getattr(self._get_layer(index), "per_layer_embedding", None)
++                if ple is not None:
++                    ple_states[index] = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
++
+             def custom_forward(
+                 hidden_states,
+                 attention_mask,
+@@ -527,32 +543,40 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+                 deepstack_visual_embeds = list(deepstack_visual_embeds_args) if deepstack_visual_embeds_args else None
+                 for index in range(start, end):
+                     layer = self._get_layer(index)
++                    ple = getattr(layer, "per_layer_embedding", None)
++                    if ple is not None:
++                        previous_ple_state = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
++                        ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = ple_states[index]
+                     inner_fp8_context = (
+                         get_fp8_context(self.config, layer.layer_number - 1)
+                         if use_inner_fp8_context
+                         else nullcontext()
+                     )
+-                    with inner_fp8_context:
+-                        hidden_states, context = layer(
+-                            hidden_states=hidden_states,
+-                            attention_mask=attention_mask,
+-                            context=context,
+-                            context_mask=context_mask,
+-                            rotary_pos_emb=rotary_pos_emb,
+-                            attention_bias=attention_bias,
+-                            inference_context=None,
+-                            packed_seq_params=packed_seq_params,
+-                            padding_mask=padding_mask,
+-                        )
++                    try:
++                        with inner_fp8_context:
++                            hidden_states, context = layer(
++                                hidden_states=hidden_states,
++                                attention_mask=attention_mask,
++                                context=context,
++                                context_mask=context_mask,
++                                rotary_pos_emb=rotary_pos_emb,
++                                attention_bias=attention_bias,
++                                inference_context=None,
++                                packed_seq_params=packed_seq_params,
++                                padding_mask=padding_mask,
++                            )
+ 
+-                        if self.pre_process and deepstack_visual_embeds is not None:
+-                            l_no = layer.layer_number - 1
+-                            if l_no in range(len(deepstack_visual_embeds)):
+-                                hidden_states = self._deepstack_process(
+-                                    hidden_states,
+-                                    visual_pos_masks,
+-                                    deepstack_visual_embeds[l_no],
+-                                )
++                            if self.pre_process and deepstack_visual_embeds is not None:
++                                l_no = layer.layer_number - 1
++                                if l_no in range(len(deepstack_visual_embeds)):
++                                    hidden_states = self._deepstack_process(
++                                        hidden_states,
++                                        visual_pos_masks,
++                                        deepstack_visual_embeds[l_no],
++                                    )
++                    finally:
++                        if ple is not None:
++                            ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = previous_ple_state
+                 return hidden_states, context
+ 
+             return custom_forward
+@@ -714,6 +738,13 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+         #   is called here to be future-proof and corner-case-proof.
+         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+ 
++        # Hyper connections (e.g. Qwen4-Exp gated residual): expand the single stream to
++        # n streams at the block start, mirroring megatron.core TransformerBlock.forward.
++        if self.config.enable_mhc_connections and self.pre_process:
++            hidden_states = HyperConnectionModule.input_expand(
++                hidden_states, self.mhc_num_residual_streams
++            )  # [s, b, C] -> [s, b, n*C]
++
+         if self.config.sequence_parallel:
+             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+         else:
+@@ -786,6 +817,11 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+                     ):
+                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+ 
++        # MTP's gated-residual branch consumes the full residual-stream tensor;
++        # the main LM head still consumes the contracted output below.
++        if self.config.mtp_num_layers and self.post_process and self.config.enable_mhc_connections:
++            self._mtp_multistream = hidden_states
++
+         # Final layer norm.
+         if self.final_layernorm is not None:
+             hidden_states = self.final_layernorm(hidden_states)
+diff --git a/tests/functional_tests/test_groups/models/qwen/qwen4_exp_parity.py b/tests/functional_tests/test_groups/models/qwen/qwen4_exp_parity.py
+new file mode 100644
+index 000000000..c76623224
+--- /dev/null
++++ b/tests/functional_tests/test_groups/models/qwen/qwen4_exp_parity.py
+@@ -0,0 +1,245 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""HF Qwen4-Exp (toy, random) -> Megatron-Bridge -> GPTModel logits parity + HF export round trip.
++
++Launch under ``torch.distributed.run`` with ``--nproc_per_node=<tp>``::
++
++    python -m torch.distributed.run --nproc_per_node=2 qwen4_exp_parity.py --hf-model-path <dir> --tp 2
++
++The toy model enables every Qwen4-Exp feature: the GDN / QSA hybrid, 4-stream gated residuals, a
++PLE layer with a sharded n-gram table, and the MoE with a gated shared expert. It is compared in
++fp32 (TE unfused attention) so that mismatches are visible above numerical noise.
++"""
++
++import argparse
++import glob
++import os
++import sys
++
++import torch
++import torch.distributed as dist
++
++
++HF_QWEN4_EXP_TOY_MODEL_CONFIG = {
++    "vocab_size": 256,
++    "hidden_size": 64,
++    "num_hidden_layers": 4,
++    "num_attention_heads": 4,
++    "num_key_value_heads": 2,
++    "head_dim": 16,
++    "max_position_embeddings": 4096,
++    "rms_norm_eps": 1e-6,
++    "rope_parameters": {"rope_theta": 10000.0, "partial_rotary_factor": 0.5, "rope_type": "default"},
++    "linear_conv_kernel_dim": 4,
++    "linear_key_head_dim": 16,
++    "linear_num_key_heads": 2,
++    "linear_num_value_heads": 4,
++    "linear_value_head_dim": 16,
++    "moe_intermediate_size": 32,
++    "shared_expert_intermediate_size": 32,
++    "num_experts": 8,
++    "num_experts_per_tok": 2,
++    "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
++    "hc_count": 4,
++    "hc_lowrank": 8,
++    "ple_layer_ids": [2],
++    "ple_embed_dim": 64,
++    "ple_conv_kernel_size": 4,
++    "ngram_size": 3,
++    "heads_per_ngram": 2,
++    "ngram_vocab_size_base": 97,
++    "make_ngram_vocab_size_divisible_by": 8,
++    "seed": 1234,
++    "split_ngram_parts": 4,
++    "indexer_n_heads": 2,
++    "indexer_kv_heads": 1,
++    "indexer_head_dim": 16,
++    "indexer_budget": 8,
++    "indexer_compress_ratio": 4,
++    "output_gate_type": "sigmoid",
++    "bos_token_id": 1,
++    "eos_token_id": 2,
++    "pad_token_id": 0,
++    "tie_word_embeddings": False,
++    "initializer_range": 0.05,
++}
++
++
++def build_toy_checkpoint(path: str, seed: int = 0):
++    """Create and save a random text-only Qwen4-Exp toy model (fp32 safetensors)."""
++    from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
++
++    torch.manual_seed(seed)
++    config = Qwen4ExpTextConfig(**HF_QWEN4_EXP_TOY_MODEL_CONFIG, dtype="float32")
++    model = Qwen4ExpForCausalLM(config)
++    with torch.no_grad():
++        for name, param in model.named_parameters():
++            # Zero-initialized gains / PLE conv would hide mapping bugs: give them signal.
++            if param.ndim > 0 and "A_log" not in name and "dt_bias" not in name and param.abs().max() == 0:
++                param.normal_(0, 0.1)
++            if "ple.conv1d" in name:
++                param.normal_(0, 0.3)
++    model.save_pretrained(path, safe_serialization=True)
++    return model
++
++
++def _load_safetensors(directory: str) -> dict:
++    from safetensors.torch import load_file
++
++    tensors = {}
++    for file in glob.glob(os.path.join(directory, "*.safetensors")):
++        tensors.update(load_file(file))
++    return tensors
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--hf-model-path", required=True)
++    parser.add_argument("--tp", type=int, default=1)
++    parser.add_argument("--seq", type=int, default=40, help="sequence length (multiple of tp)")
++    parser.add_argument("--force-sparse", action="store_true", help="always run the QSA sparse kernel")
++    parser.add_argument("--export-dir", default=None)
++    parser.add_argument("--tolerance", type=float, default=2e-2, help="relative tolerance on logits")
++    args = parser.parse_args()
++
++    dist.init_process_group("nccl")
++    rank = dist.get_rank()
++    torch.cuda.set_device(rank % torch.cuda.device_count())
++
++    from transformers import Qwen4ExpForCausalLM
++
++    hf_model = Qwen4ExpForCausalLM.from_pretrained(args.hf_model_path, dtype=torch.float32).cuda().eval()
++    cfg = hf_model.config
++
++    from megatron.core import parallel_state
++    from megatron.core.packed_seq_params import PackedSeqParams
++    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
++    from megatron.core.transformer.enums import AttnBackend
++
++    from megatron.bridge import AutoBridge
++
++    parallel_state.initialize_model_parallel(tensor_model_parallel_size=args.tp)
++    model_parallel_cuda_manual_seed(123)
++
++    bridge = AutoBridge.from_hf_pretrained(args.hf_model_path)
++    provider = bridge.to_megatron_provider(load_weights=False)
++    provider.tensor_model_parallel_size = args.tp
++    provider.pipeline_model_parallel_size = 1
++    provider.sequence_parallel = args.tp > 1
++    provider.params_dtype = torch.float32
++    provider.bf16 = False
++    provider.pipeline_dtype = torch.float32
++    provider.autocast_dtype = torch.float32
++    provider.attention_backend = AttnBackend.unfused
++    provider.gradient_accumulation_fusion = False
++    provider.moe_router_dtype = "fp32"
++    provider.variable_seq_lengths = True
++    provider.qsa_force_sparse = args.force_sparse
++    provider.finalize()
++    model = provider.provide_distributed_model(wrap_with_ddp=False)
++    bridge.load_hf_weights(model)
++    gpt = model[0].eval()
++
++    ok = True
++    torch.manual_seed(7)
++    b, s = 2, args.seq
++    input_ids = torch.randint(3, cfg.vocab_size, (b, s), device="cuda")
++    input_ids[0, 9] = cfg.eos_token_id  # exercise the n-gram context reset
++    dist.broadcast(input_ids, 0)
++    position_ids = torch.arange(s, device="cuda").unsqueeze(0).expand(b, -1)
++
++    with torch.no_grad():
++        hf_logits = hf_model(input_ids=input_ids).logits.float()
++        mg_logits = gpt(input_ids, position_ids, None, runtime_gather_output=True).float()
++    scale = max(1.0, hf_logits.abs().max().item())
++    diff = (hf_logits - mg_logits).abs().max().item()
++    argmax_agreement = (hf_logits.argmax(-1) == mg_logits.argmax(-1)).float().mean().item()
++    if rank == 0:
++        print(
++            f"[TP={args.tp}] bshd: max|diff|={diff:.3e} (logit range {scale:.3f}), argmax agreement {argmax_agreement:.3f}"
++        )
++    ok &= diff < args.tolerance * scale
++
++    # Packed (THD) sequences: two documents, positions restart per document.
++    lens = [s, s - 8]
++    packed = torch.cat([input_ids[0], input_ids[1, : lens[1]]]).unsqueeze(0)
++    cu_seqlens = torch.tensor([0, lens[0], lens[0] + lens[1]], device="cuda", dtype=torch.int32)
++    packed_seq_params = PackedSeqParams(
++        qkv_format="thd",
++        cu_seqlens_q=cu_seqlens,
++        cu_seqlens_kv=cu_seqlens,
++        max_seqlen_q=max(lens),
++        max_seqlen_kv=max(lens),
++    )
++    packed_positions = torch.cat([torch.arange(lens[0]), torch.arange(lens[1])]).unsqueeze(0).cuda()
++    with torch.no_grad():
++        mg_thd = gpt(packed, packed_positions, None, packed_seq_params=packed_seq_params, runtime_gather_output=True)
++        ref = torch.cat([hf_logits[0], hf_model(input_ids=input_ids[1:, : lens[1]]).logits.float()[0]], dim=0)
++    diff_thd = (mg_thd.float()[0] - ref).abs().max().item()
++    if rank == 0:
++        print(f"[TP={args.tp}] thd: max|diff|={diff_thd:.3e}")
++    ok &= diff_thd < args.tolerance * scale
++
++    # Backward: every tensor-parallel rank must run the same collectives (the PLE halo exchange
++    # and the vocab-parallel n-gram table both take part in autograd); compare a parameter
++    # gradient against HF to check the gated-residual / QSA / PLE backward paths.
++    gpt.train()
++    hf_model.train()
++    mg_out = gpt(input_ids, position_ids, None, runtime_gather_output=True).float()
++    hf_out = hf_model(input_ids=input_ids).logits.float()
++    targets = torch.roll(input_ids, -1, dims=1)
++    mg_loss = torch.nn.functional.cross_entropy(mg_out.reshape(-1, mg_out.shape[-1]), targets.reshape(-1))
++    hf_loss = torch.nn.functional.cross_entropy(hf_out.reshape(-1, hf_out.shape[-1]), targets.reshape(-1))
++    mg_loss.backward()
++    hf_loss.backward()
++    mg_grad = gpt.embedding.word_embeddings.weight.grad
++    hf_grad = hf_model.model.embed_tokens.weight.grad
++    # Vocab-parallel embedding: compare this rank's rows.
++    rows = hf_grad.shape[0] // args.tp
++    hf_rows = hf_grad[rank * rows : (rank + 1) * rows]
++    grad_diff = (mg_grad.float() - hf_rows).abs().max().item()
++    grad_scale = max(1e-6, hf_rows.abs().max().item())
++    if rank == 0:
++        print(
++            f"[TP={args.tp}] backward: loss mg={mg_loss.item():.5f} hf={hf_loss.item():.5f}, "
++            f"embedding grad max|diff|={grad_diff:.3e} (grad range {grad_scale:.3e})"
++        )
++    ok &= abs(mg_loss.item() - hf_loss.item()) < args.tolerance and grad_diff < 5e-2 * grad_scale
++    gpt.eval()
++    hf_model.eval()
++
++    # Export: Megatron -> HF safetensors must reproduce the source tensors.
++    export_dir = args.export_dir or (args.hf_model_path.rstrip("/") + f"_export_tp{args.tp}")
++    bridge.save_hf_weights(model, export_dir, show_progress=False)
++    dist.barrier()
++    if rank == 0:
++        source, exported = _load_safetensors(args.hf_model_path), _load_safetensors(export_dir)
++        missing = sorted(set(source) - set(exported))
++        worst = max(
++            ((exported[n].float() - t.float()).abs().max().item() for n, t in source.items() if n in exported),
++            default=0.0,
++        )
++        print(f"[TP={args.tp}] export: {len(exported)} tensors, missing={len(missing)}, max|diff|={worst:.3e}")
++        ok &= not missing and worst < 1e-6
++        print("PARITY", "OK" if ok else "FAILED")
++    ok_tensor = torch.tensor(int(ok), device="cuda")
++    dist.broadcast(ok_tensor, 0)
++    dist.barrier()
++    dist.destroy_process_group()
++    return 0 if ok_tensor.item() else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/functional_tests/test_groups/models/qwen/test_qwen4_exp_conversion.py b/tests/functional_tests/test_groups/models/qwen/test_qwen4_exp_conversion.py
+new file mode 100644
+index 000000000..262590732
+--- /dev/null
++++ b/tests/functional_tests/test_groups/models/qwen/test_qwen4_exp_conversion.py
+@@ -0,0 +1,64 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Qwen4-Exp (Qwen3.8-Flash-Next) HF <-> Megatron conversion and forward-parity tests."""
++
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from tests.functional_tests.test_groups.models.qwen.qwen4_exp_parity import build_toy_checkpoint
++
++
++class TestQwen4ExpConversion:
++    """Toy Qwen4-Exp model: HF -> Megatron logits parity (bshd + THD) and Megatron -> HF export."""
++
++    @pytest.fixture(scope="class")
++    def qwen4_exp_toy_model_path(self, tmp_path_factory):
++        model_dir = tmp_path_factory.mktemp("qwen4_exp_toy_model") / "qwen4_exp_toy"
++        build_toy_checkpoint(str(model_dir))
++        return str(model_dir)
++
++    @pytest.mark.run_only_on("GPU")
++    @pytest.mark.parametrize("tp,force_sparse", [(1, False), (2, False), (2, True)])
++    def test_qwen4_exp_parity(self, qwen4_exp_toy_model_path, tmp_path, tp, force_sparse):
++        script = Path(__file__).with_name("qwen4_exp_parity.py")
++        cmd = [
++            sys.executable,
++            "-m",
++            "torch.distributed.run",
++            f"--nproc_per_node={tp}",
++            "--nnodes=1",
++            str(script),
++            "--hf-model-path",
++            qwen4_exp_toy_model_path,
++            "--tp",
++            str(tp),
++            "--export-dir",
++            str(tmp_path / f"export_tp{tp}"),
++        ]
++        if force_sparse:
++            cmd.append("--force-sparse")
++        env = dict(os.environ)
++        # NVLink SHARP multicast is not available in every container / fabric configuration.
++        env.setdefault("NCCL_NVLS_ENABLE", "0")
++        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
++        assert result.returncode == 0, (
++            f"Qwen4-Exp parity (tp={tp}, force_sparse={force_sparse}) failed\n"
++            f"STDOUT: {result.stdout[-4000:]}\nSTDERR: {result.stderr[-4000:]}"
++        )
++        assert "PARITY OK" in result.stdout
+diff --git a/tests/unit_tests/models/qwen/test_qwen4_exp_bridge.py b/tests/unit_tests/models/qwen/test_qwen4_exp_bridge.py
+new file mode 100644
+index 000000000..e9df77967
+--- /dev/null
++++ b/tests/unit_tests/models/qwen/test_qwen4_exp_bridge.py
+@@ -0,0 +1,477 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Unit tests for the Qwen4-Exp (Qwen3.8-Flash-Next) bridge."""
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++from megatron.core.models.gpt.gpt_model import GPTModel
++
++from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
++from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
++from megatron.bridge.models.gpt_provider import GPTModelProvider
++from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
++from megatron.bridge.models.qwen.qwen4_exp_bridge import (
++    PLENGramEmbeddingMapping,
++    Qwen4ExpBridge,
++    Qwen4ExpTextBridge,
++    get_qwen4_exp_hf_lm_prefix,
++    linear_attention_pattern_from_hf,
++    ple_local_rows_from_shards,
++)
++from megatron.bridge.models.qwen.qwen4_exp_vl_bridge import Qwen4ExpVLBridge
++from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import _select_packed_cp_if_full_sequence
++from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
++
++
++def _text_config_dict(num_layers=8):
++    layer_types = ["qwen_sparse_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(num_layers)]
++    return {
++        "attention_bias": False,
++        "attention_dropout": 0.0,
++        "bos_token_id": 248044,
++        "eos_token_id": 248044,
++        "hc_count": 4,
++        "hc_lowrank": 320,
++        "head_dim": 256,
++        "heads_per_ngram": 8,
++        "hidden_act": "silu",
++        "hidden_size": 2560,
++        "indexer_budget": 2048,
++        "indexer_compress_ratio": 4,
++        "indexer_head_dim": 128,
++        "indexer_kv_heads": 1,
++        "indexer_n_heads": 4,
++        "initializer_range": 0.02,
++        "layer_types": layer_types,
++        "linear_conv_kernel_dim": 4,
++        "linear_key_head_dim": 128,
++        "linear_num_key_heads": 16,
++        "linear_num_value_heads": 48,
++        "linear_value_head_dim": 128,
++        "make_ngram_vocab_size_divisible_by": 128,
++        "max_position_embeddings": 262144,
++        "model_type": "qwen4_exp_text",
++        "moe_intermediate_size": 640,
++        "mtp_num_hidden_layers": 1,
++        "ngram_size": 3,
++        "ngram_vocab_size_base": 20000000,
++        "num_attention_heads": 24,
++        "num_experts": 512,
++        "num_experts_per_tok": 10,
++        "num_hidden_layers": num_layers,
++        "num_key_value_heads": 2,
++        "output_gate_type": "sigmoid",
++        "ple_conv_kernel_size": 4,
++        "ple_embed_dim": 2560,
++        "ple_layer_ids": [2],
++        "rms_norm_eps": 1e-06,
++        "rope_parameters": {
++            "mrope_interleaved": True,
++            "mrope_section": [11, 11, 10],
++            "partial_rotary_factor": 0.25,
++            "rope_theta": 10000000,
++            "rope_type": "default",
++        },
++        "router_aux_loss_coef": 0.001,
++        "seed": 1234,
++        "shared_expert_intermediate_size": 640,
++        "split_ngram_parts": 128,
++        "tie_word_embeddings": False,
++        "vocab_size": 248320,
++    }
++
++
++def _namespace(d):
++    return SimpleNamespace(**d)
++
++
++@pytest.fixture
++def vl_config():
++    return _namespace(
++        {
++            "architectures": ["Qwen4ExpForConditionalGeneration"],
++            "model_type": "qwen4_exp",
++            "tie_word_embeddings": False,
++            "text_config": _namespace(_text_config_dict()),
++            "vision_config": _namespace({"depth": 27}),
++        }
++    )
++
++
++@pytest.fixture
++def mock_pretrained(vl_config):
++    pretrained = Mock(spec=PreTrainedCausalLM)
++    pretrained.config = vl_config
++    pretrained.model = Mock()
++    pretrained.model.dtype = torch.bfloat16
++    # Checkpoint keys: fused experts and 128 PLE shards, like the released checkpoint.
++    source = Mock()
++    source.get_all_keys.return_value = [
++        "model.language_model.layers.0.mlp.experts.gate_up_proj",
++        "model.language_model.layers.0.mlp.experts.down_proj",
++    ] + [f"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{i}.weight" for i in range(128)]
++    pretrained.state = Mock()
++    pretrained.state.source = source
++    return pretrained
++
++
++class TestQwen4ExpProvider:
++    def test_registration(self):
++        assert issubclass(Qwen4ExpBridge, MegatronModelBridge)
++        assert issubclass(Qwen4ExpTextBridge, Qwen4ExpBridge)
++
++    def test_layer_pattern_accepts_qsa_layer_type(self, vl_config):
++        pattern = linear_attention_pattern_from_hf(vl_config.text_config)
++        assert pattern == [1, 1, 1, 0, 1, 1, 1, 0]
++        with pytest.raises(ValueError):
++            linear_attention_pattern_from_hf(_namespace({"layer_types": ["bogus"]}))
++
++    def test_prefixes(self, vl_config):
++        assert get_qwen4_exp_hf_lm_prefix(vl_config) == "model.language_model."
++        assert get_qwen4_exp_hf_lm_prefix(_namespace({"text_config": None})) == "model."
++
++    def test_provider_bridge(self, mock_pretrained, vl_config):
++        provider = Qwen4ExpBridge().provider_bridge(mock_pretrained)
++        text = vl_config.text_config
++
++        assert isinstance(provider, GPTModelProvider)
++        assert provider.num_layers == text.num_hidden_layers
++        assert provider.hidden_size == 2560
++        assert provider.num_attention_heads == 24 and provider.num_query_groups == 2
++        assert provider.kv_channels == 256
++        assert provider.rotary_base == 10000000 and provider.rotary_percent == 0.25
++        assert provider.vocab_size == 248320 and not provider.share_embeddings_and_output_weights
++
++        # Qwen3.5-MoE base
++        assert provider.experimental_attention_variant == "gdn"
++        assert provider.linear_attention_freq == [1, 1, 1, 0, 1, 1, 1, 0]
++        assert provider.linear_num_value_heads == 48 and provider.linear_num_key_heads == 16
++        assert provider.linear_attention_output_gate_activation == "sigmoid"
++        assert provider.attention_output_gate and provider.qk_layernorm and provider.layernorm_zero_centered_gamma
++        assert provider.num_moe_experts == 512 and provider.moe_router_topk == 10
++        assert provider.moe_ffn_hidden_size == 640 and provider.moe_shared_expert_intermediate_size == 640
++        assert provider.moe_shared_expert_gate and provider.moe_grouped_gemm
++
++        # Qwen4-Exp additions
++        assert provider.enable_mhc_connections and provider.mhc_variant == "gated_residual"
++        assert provider.mhc_num_residual_streams == 4 and provider.mhc_gated_residual_rank == 320
++        assert provider.qsa_indexer_n_heads == 4 and provider.qsa_indexer_head_dim == 128
++        assert provider.qsa_indexer_budget == 2048 and provider.qsa_indexer_compress_ratio == 4
++        assert provider.ple_layer_ids == [2] and provider.ple_eos_token_id == 248044
++        assert provider.ple_unigram_vocab_size == 248320 and provider.ple_ngram_vocab_size_base == 20000000
++        assert provider.mtp_num_layers is None
++
++    def test_provider_finalizes(self, mock_pretrained):
++        """The provider must pass megatron-core's config validation once parallelism is set."""
++        provider = Qwen4ExpBridge().provider_bridge(mock_pretrained)
++        provider.tensor_model_parallel_size = 1
++        provider.pipeline_model_parallel_size = 1
++        provider.finalize()
++        assert provider.ple_layer_ids == [2]
++
++    def test_vl_mtp_follows_checkpoint_config(self, mock_pretrained):
++        bridge = Qwen4ExpVLBridge()
++        provider = bridge.provider_bridge(mock_pretrained)
++        assert provider.mtp_num_layers == 1
++        assert provider.mtp_loss_scaling_factor == 0.1
++
++        mock_pretrained.config.text_config.mtp_num_hidden_layers = 0
++        provider = bridge.provider_bridge(mock_pretrained)
++        assert provider.mtp_num_layers is None
++
++    def test_vl_mtp_labels_preserve_main_logits(self):
++        labels = torch.tensor([[1, 2]])
++        hidden_states = torch.ones(2, 1, 2)
++
++        class Decoder:
++            calls = 0
++
++            def __call__(self, **kwargs):
++                self.calls += 1
++                self._mtp_multistream = torch.full((2, 1, 8), float(self.calls))
++                return hidden_states
++
++        decoder = Decoder()
++        model = SimpleNamespace(
++            config=SimpleNamespace(ple_layer_ids=[]),
++            mtp_process=False,
++            _preprocess=lambda **kwargs: (hidden_states, None, None, None, None),
++            decoder=decoder,
++            _postprocess=lambda **kwargs: kwargs,
++        )
++        forwarded = Qwen3VLGPTModel.forward(
++            model,
++            input_ids=labels,
++            position_ids=None,
++            attention_mask=None,
++            mtp_kwargs={"mtp_labels": labels},
++        )
++        assert forwarded["labels"] is labels
++        torch.testing.assert_close(forwarded["mhc_multistream"], torch.ones(2, 1, 8))
++        assert not hasattr(decoder, "_mtp_multistream")
++        second = Qwen3VLGPTModel.forward(
++            model,
++            input_ids=labels,
++            position_ids=None,
++            attention_mask=None,
++            mtp_kwargs={"mtp_labels": labels},
++        )
++        torch.testing.assert_close(second["mhc_multistream"], torch.full((2, 1, 8), 2.0))
++        assert not hasattr(decoder, "_mtp_multistream")
++        output_layer = lambda states, **kwargs: (states + 1, None)
++        logits = forwarded["output_processor"](
++            hidden_states=hidden_states,
++            output_layer=output_layer,
++            output_weight=None,
++            runtime_gather_output=False,
++            scale_logits=lambda tensor: tensor * 2,
++        )
++        torch.testing.assert_close(logits, ((hidden_states + 1) * 2).transpose(0, 1).contiguous())
++        native = GPTModel._postprocess(
++            SimpleNamespace(
++                share_embeddings_and_output_weights=False,
++                post_process=True,
++                output_layer=output_layer,
++                _scale_logits=lambda tensor: tensor * 2,
++                config=SimpleNamespace(mtp_num_layers=0),
++            ),
++            hidden_states=hidden_states,
++            input_ids=None,
++            position_ids=None,
++            rotary_pos_emb=None,
++            rotary_pos_cos=None,
++            rotary_pos_sin=None,
++            labels=None,
++        )
++        torch.testing.assert_close(logits, native)
++
++    def test_vl_mtp_first_pipeline_stage_does_not_forward_streams(self):
++        hidden_states = torch.ones(2, 1, 2)
++        model = SimpleNamespace(
++            config=SimpleNamespace(ple_layer_ids=[]),
++            mtp_process=False,
++            _preprocess=lambda **kwargs: (hidden_states, None, None, None, None),
++            decoder=lambda **kwargs: hidden_states,
++            _postprocess=lambda **kwargs: kwargs,
++        )
++        forwarded = Qwen3VLGPTModel.forward(
++            model,
++            input_ids=torch.ones(1, 2, dtype=torch.long),
++            position_ids=None,
++            attention_mask=None,
++        )
++        assert "mhc_multistream" not in forwarded
++
++    def test_vl_packed_cp_accepts_local_mtp_labels_and_mask(self):
++        index = torch.tensor([0, 2, 5])
++        full = torch.arange(6).unsqueeze(0)
++        local = full.index_select(1, index)
++
++        selected, did_select = _select_packed_cp_if_full_sequence(full, index, full_sequence_length=6)
++        torch.testing.assert_close(selected, local)
++        assert did_select
++
++        selected, did_select = _select_packed_cp_if_full_sequence(local, index, full_sequence_length=6)
++        torch.testing.assert_close(selected, local)
++        assert not did_select
++
++        with pytest.raises(ValueError, match="full or 3 local tokens"):
++            _select_packed_cp_if_full_sequence(torch.zeros(1, 4), index, full_sequence_length=6)
++
++
++class TestQwen4ExpMappings:
++    def test_vl_mtp_maps_all_published_parameters(self):
++        registry = MegatronMappingRegistry(*Qwen4ExpVLBridge._get_mtp_mappings())
++        expected = {
++            "mtp.pre_fc_norm_embedding.weight",
++            "mtp.pre_fc_norm_hidden.weight",
++            "mtp.fc_embedding.weight",
++            "mtp.fc_hidden.weight",
++            *(
++                f"mtp.hyper_connection_mixer.{name}"
++                for name in ("hc_norm.weight", "input_mix_weight_down.weight", "input_mix_weight_up.weight")
++            ),
++            *(
++                f"mtp.layers.0.{part}_hyper_connection.{name}"
++                for part in ("attn", "mlp")
++                for name in (
++                    "hc_norm.weight",
++                    "input_mix_weight_down.weight",
++                    "input_mix_weight_up.weight",
++                    "block_inject_weight.weight",
++                )
++            ),
++            *(
++                f"mtp.layers.0.self_attn.{name}"
++                for name in (
++                    "q_proj.weight",
++                    "k_proj.weight",
++                    "v_proj.weight",
++                    "o_proj.weight",
++                    "q_norm.weight",
++                    "k_norm.weight",
++                    "indexer.index_qk_proj.weight",
++                    "indexer.q_layernorm.weight",
++                    "indexer.k_layernorm.weight",
++                )
++            ),
++            *(
++                f"mtp.layers.0.mlp.{name}"
++                for name in (
++                    "gate.weight",
++                    "shared_expert.gate_proj.weight",
++                    "shared_expert.up_proj.weight",
++                    "shared_expert.down_proj.weight",
++                    "shared_expert_gate.weight",
++                    "experts.gate_up_proj",
++                    "experts.down_proj",
++                )
++            ),
++        }
++        assert len(expected) == 31
++        assert all(registry.hf_to_megatron_lookup(name) is not None for name in expected)
++
++    def test_mapping_registry_covers_all_components(self, mock_pretrained, vl_config):
++        bridge = Qwen4ExpBridge()
++        bridge.hf_pretrained = mock_pretrained
++        registry = bridge.mapping_registry()
++        hf = "model.language_model."
++
++        expectations = {
++            "embedding.word_embeddings.weight": f"{hf}embed_tokens.weight",
++            "output_layer.weight": "lm_head.weight",
++            "decoder.final_layernorm.hc_norm.weight": f"{hf}hyper_connection_mixer.hc_norm.weight",
++            "decoder.final_layernorm.input_mix_weight_down.weight": f"{hf}hyper_connection_mixer.input_mix_weight_down.weight",
++            "decoder.layers.3.self_attention_hyper_connection.block_inject_weight.weight": f"{hf}layers.3.attn_hyper_connection.block_inject_weight.weight",
++            "decoder.layers.3.mlp_hyper_connection.input_mix_weight_up.weight": f"{hf}layers.3.mlp_hyper_connection.input_mix_weight_up.weight",
++            "decoder.layers.3.self_attention.indexer.index_qk_proj.weight": f"{hf}layers.3.self_attn.indexer.index_qk_proj.weight",
++            "decoder.layers.3.self_attention.indexer.k_layernorm.weight": f"{hf}layers.3.self_attn.indexer.k_layernorm.weight",
++            "decoder.layers.3.self_attention.q_layernorm.weight": f"{hf}layers.3.self_attn.q_norm.weight",
++            "decoder.layers.3.self_attention.linear_proj.weight": f"{hf}layers.3.self_attn.o_proj.weight",
++            "decoder.layers.0.self_attention.out_norm.weight": f"{hf}layers.0.linear_attn.norm.weight",
++            "decoder.layers.0.self_attention.A_log": f"{hf}layers.0.linear_attn.A_log",
++            "decoder.layers.0.mlp.router.weight": f"{hf}layers.0.mlp.gate.weight",
++            "decoder.layers.0.mlp.shared_experts.gate_weight": f"{hf}layers.0.mlp.shared_expert_gate.weight",
++            "decoder.layers.1.per_layer_embedding.key_proj.weight": f"{hf}layers.1.ple.key_proj.weight",
++            "decoder.layers.1.per_layer_embedding.conv1d.weight": f"{hf}layers.1.ple.conv1d.weight",
++        }
++        for megatron_name, hf_name in expectations.items():
++            mapping = registry.megatron_to_hf_lookup(megatron_name)
++            assert mapping is not None, megatron_name
++            assert mapping.hf_param == hf_name, (megatron_name, mapping.hf_param)
++
++        qkv = registry.megatron_to_hf_lookup("decoder.layers.3.self_attention.linear_qkv.weight")
++        assert qkv.hf_param == {
++            "q": f"{hf}layers.3.self_attn.q_proj.weight",
++            "k": f"{hf}layers.3.self_attn.k_proj.weight",
++            "v": f"{hf}layers.3.self_attn.v_proj.weight",
++        }
++        in_proj = registry.megatron_to_hf_lookup("decoder.layers.0.self_attention.in_proj.weight")
++        assert set(in_proj.hf_param) == {"qkv", "z", "b", "a"}
++        experts = registry.megatron_to_hf_lookup("decoder.layers.0.mlp.experts.linear_fc1.weight5")
++        assert experts.hf_param == f"{hf}layers.0.mlp.experts.gate_up_proj"
++
++        ple = registry.megatron_to_hf_lookup(
++            "decoder.layers.1.per_layer_embedding.ple_embedding.ngram_embedding.weight"
++        )
++        assert isinstance(ple, PLENGramEmbeddingMapping)
++        assert ple.num_shards == 128
++        assert ple.hf_param["shard_0"] == f"{hf}layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
++        assert ple.hf_param["shard_127"].endswith("shard_127.weight")
++
++    def test_num_ple_shards_from_checkpoint_keys(self, mock_pretrained, vl_config):
++        mock_pretrained.state.source.get_all_keys.return_value = [
++            f"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{i}.weight" for i in range(16)
++        ]
++        bridge = Qwen4ExpBridge()
++        bridge.hf_pretrained = mock_pretrained
++        assert bridge._num_ple_shards(vl_config.text_config) == 16
++
++
++class TestPLEShardLoading:
++    @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
++    def test_local_rows_cover_rank_range(self, tp_size):
++        num_shards, shard_rows, dim = 16, 6, 3
++        table = torch.arange(num_shards * shard_rows * dim, dtype=torch.float32).view(-1, dim)
++        loaded = []
++
++        def load_shard(i):
++            loaded.append(i)
++            return table[i * shard_rows : (i + 1) * shard_rows]
++
++        rows_per_rank = table.shape[0] // tp_size
++        for rank in range(tp_size):
++            loaded.clear()
++            rows = ple_local_rows_from_shards(load_shard, num_shards, table.shape[0], shard_rows, rank, tp_size)
++            torch.testing.assert_close(rows, table[rank * rows_per_rank : (rank + 1) * rows_per_rank])
++            # Only the overlapping shards are read.
++            assert len(loaded) <= -(-rows_per_rank // shard_rows) + 1
++
++    def test_rejects_indivisible_tables(self):
++        with pytest.raises(ValueError):
++            ple_local_rows_from_shards(lambda i: torch.zeros(5, 2), 3, 15, 5, 0, 2)
++
++    def test_export_resplits_shards(self):
++        mapping = PLENGramEmbeddingMapping("x.weight", "hf.shard_{}.weight", num_shards=4)
++        mapping.broadcast_from_pp_rank = lambda t, cache_key=None: t
++        full = torch.arange(24.0).view(12, 2)
++        out = mapping.megatron_to_hf(full, None)
++        assert list(out) == [f"hf.shard_{i}.weight" for i in range(4)]
++        torch.testing.assert_close(torch.cat(list(out.values()), dim=0), full)
++
++    @pytest.mark.parametrize("tp_size,num_shards", [(2, 4), (4, 4), (4, 6), (3, 5)])
++    def test_export_streams_one_shard_at_a_time_across_tp(self, monkeypatch, tp_size, num_shards):
++        """Each shard is assembled from the ranks' row slices (one collective per shard)."""
++        dim = 3
++        rows_per_rank = 12
++        full = torch.arange(float(tp_size * rows_per_rank * dim)).view(-1, dim)
++        shard_rows = -(-full.shape[0] // num_shards)
++
++        # Stand in for the TP group: one mapping per rank (the TP coordinates are class
++        # properties), run every rank's contribution for the same shard and sum them, which is
++        # what the all_reduce does.
++        mappings = []
++        for rank in range(tp_size):
++            rank_cls = type(
++                f"RankMapping{rank}",
++                (PLENGramEmbeddingMapping,),
++                {
++                    "tp_size": property(lambda self, n=tp_size: n),
++                    "tp_rank": property(lambda self, r=rank: r),
++                    "tp_group": property(lambda self: None),
++                },
++            )
++            mappings.append(rank_cls("x.weight", "hf.shard_{}.weight", num_shards=num_shards))
++        contributions = []
++        monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, group=None: contributions.append(t.clone()))
++
++        for i in range(num_shards):
++            contributions.clear()
++            for rank, m in enumerate(mappings):
++                local = full[rank * rows_per_rank : (rank + 1) * rows_per_rank]
++                m.gather_shard(local, i)
++            assert len(contributions) == tp_size
++            shard = torch.stack(contributions).sum(0)
++            torch.testing.assert_close(shard, full[i * shard_rows : (i + 1) * shard_rows])
++
++        # The export mapping is lazy: building and listing it gathers nothing.
++        contributions.clear()
++        mappings[0].broadcast_from_pp_rank = lambda t, cache_key=None: t
++        out = mappings[0].megatron_to_hf(full[:rows_per_rank], None)
++        assert len(out) == num_shards and list(out) == [f"hf.shard_{i}.weight" for i in range(num_shards)]
++        assert contributions == []
+diff --git a/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_model.py b/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_model.py
+index a06a1d4e8..e4cf95e6b 100644
+--- a/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_model.py
++++ b/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_model.py
+@@ -1075,6 +1075,71 @@ class TestQwen3VLModel:
+         assert torch.equal(local_loss_mask, loss_mask.index_select(1, cp_index))
+         assert torch.equal(output, torch.ones(1))
+ 
++    def test_forward_builds_mtp_mask_after_packed_cp_partition(self, monkeypatch):
++        """The MTP conditioning mask follows the same packed CP slice as input IDs."""
++        monkeypatch.setattr(
++            "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model.torch.cuda.nvtx.range_push",
++            lambda *_args, **_kwargs: None,
++        )
++        monkeypatch.setattr(
++            "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model.torch.cuda.nvtx.range_pop",
++            lambda *_args, **_kwargs: None,
++        )
++        cp_index = torch.tensor([0, 3, 4, 7], dtype=torch.long)
++        monkeypatch.setattr(
++            "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model.get_packed_seq_cp_partition_indices",
++            lambda *args, **kwargs: cp_index,
++        )
++
++        class DummyLanguageModel:
++            def __init__(self):
++                self.rotary_pos_emb = SimpleNamespace(is_thd_format=False)
++                self.last_kwargs = None
++
++            def __call__(self, **kwargs):
++                self.last_kwargs = kwargs
++                return torch.ones(1)
++
++        language_model = DummyLanguageModel()
++        model = SimpleNamespace(
++            pre_process=False,
++            config=SimpleNamespace(sequence_parallel=False),
++            pg_collection=SimpleNamespace(
++                cp=SimpleNamespace(rank=lambda: 0, size=lambda: 2),
++                tp=SimpleNamespace(rank=lambda: 0, size=lambda: 1),
++                pp=object(),
++            ),
++            language_model=language_model,
++            image_token_id=1,
++            video_token_id=2,
++            use_dist_train=False,
++        )
++        input_ids = torch.tensor([[1, 11, 12, 13, 2, 14, 15, 16]])
++        position_ids = torch.arange(8).view(1, 1, 8).expand(3, -1, -1).clone()
++        mtp_labels = input_ids.roll(-1, dims=-1)
++        packed_seq_params = _make_packed_seq_params([0, 8])
++
++        output = Qwen3VLModel.forward(
++            model,
++            input_ids=input_ids,
++            position_ids=position_ids,
++            packed_seq_params=packed_seq_params,
++            mtp_kwargs={"mtp_labels": mtp_labels},
++        )
++
++        local_ids = input_ids.index_select(1, cp_index)
++        assert torch.equal(output, torch.ones(1))
++        assert language_model.last_kwargs is not None
++        assert torch.equal(language_model.last_kwargs["input_ids"], local_ids)
++        assert torch.equal(
++            language_model.last_kwargs["mtp_kwargs"]["mtp_input_mask"],
++            (local_ids != model.image_token_id) & (local_ids != model.video_token_id),
++        )
++        assert torch.equal(
++            language_model.last_kwargs["mtp_kwargs"]["mtp_labels"],
++            mtp_labels.index_select(1, cp_index),
++        )
++
+     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3VLModel.forward requires CUDA")
+     @pytest.mark.timeout(120)
+     def test_forward_non_dist_train(self, hf_config):
+diff --git a/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_text_model_forward.py b/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_text_model_forward.py
+index 64367cd92..7167702c1 100644
+--- a/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_text_model_forward.py
++++ b/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_text_model_forward.py
+@@ -42,6 +42,7 @@ class _DummyDecoder:
+ class _DummyModel:
+     def __init__(self):
+         self.decoder = _DummyDecoder()
++        self.config = SimpleNamespace(ple_layer_ids=[], sequence_parallel=False)
+         self.mtp_process = False
+         self.preprocess_output = None
+         self.preprocess_kwargs = None
+@@ -115,6 +116,25 @@ def test_forward_forwards_output_processor_hook():
+     assert dummy.postprocess_args["output_processor_context"] is output_processor_context
+ 
+ 
++def test_forward_passes_mtp_conditioning_mask_to_postprocess():
++    """MTP forwards the mask that excludes visual placeholder embeddings."""
++    dummy = _DummyModel()
++    labels = torch.tensor([[2, 3, 4, 0]])
++    mtp_input_mask = torch.tensor([[True, False, True, True]])
++
++    output = Qwen3VLGPTModel.forward(
++        dummy,
++        input_ids=torch.tensor([[1, 2, 3, 0]]),
++        position_ids=torch.arange(4).unsqueeze(0),
++        attention_mask=torch.ones((1, 4), dtype=torch.long),
++        mtp_kwargs={"mtp_labels": labels, "mtp_input_mask": mtp_input_mask},
++    )
++
++    assert output == "ok"
++    assert dummy.postprocess_args["labels"] is labels
++    assert dummy.postprocess_args["mtp_input_mask"] is mtp_input_mask
++
++
+ def test_mtp_sequence_parallel_embedding_scatter_uses_tp_group(monkeypatch):
+     """The MTP embedding wrapper must not fall back to global tensor-parallel state."""
+     expected_group = object()
+@@ -138,7 +158,7 @@ def test_mtp_sequence_parallel_embedding_scatter_uses_tp_group(monkeypatch):
+     class _DummyMTPModel(_DummyModel):
+         def __init__(self):
+             super().__init__()
+-            self.config = SimpleNamespace(sequence_parallel=True)
++            self.config = SimpleNamespace(ple_layer_ids=[], sequence_parallel=True)
+             self.embedding = _DummyEmbedding()
+             self.mtp_process = True
+             self.pg_collection = SimpleNamespace(tp=expected_group)
+@@ -296,7 +316,7 @@ def test_mtp_postprocess_receives_padded_boundaries():
+     class _DummyMTPModel(_DummyModel):
+         def __init__(self):
+             super().__init__()
+-            self.config = SimpleNamespace(sequence_parallel=False)
++            self.config = SimpleNamespace(ple_layer_ids=[], sequence_parallel=False)
+             self.mtp_process = True
+ 
+     dummy = _DummyMTPModel()
+diff --git a/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_transformer_block.py b/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_transformer_block.py
+index 34f7fa893..3b5265504 100644
+--- a/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_transformer_block.py
++++ b/tests/unit_tests/models/qwen_vl/modelling_qwen3_vl/test_transformer_block.py
+@@ -26,6 +26,7 @@ import torch.nn.functional as F
+ from megatron.core import parallel_state
+ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
++from torch.utils.checkpoint import checkpoint
+ 
+ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block import Qwen3VLTransformerBlock
+ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import Qwen3VLTransformerConfig
+@@ -73,6 +74,69 @@ def test_forward_propagates_padding_mask_to_transformer_layer():
+     assert layer.called_with["padding_mask"] is padding_mask
+ 
+ 
++@pytest.mark.unit
++@pytest.mark.parametrize("second_ids", [[4, 5, 6, 7], [4, 5, 6]])
++def test_checkpoint_replays_each_microbatch_with_its_ple_inputs(monkeypatch, second_ids):
++    """A later pipeline forward must not replace PLE inputs used by recompute."""
++    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl import transformer_block as block_module
++
++    ple = SimpleNamespace(_ngram_ids=None, _position_in_sequence=None, _cp_packed_seq_params=None)
++
++    class _Layer:
++        layer_number = 1
++        per_layer_embedding = ple
++
++        def __call__(self, hidden_states, **kwargs):
++            ids = self.per_layer_embedding._ngram_ids
++            assert ids.numel() == hidden_states.shape[0]
++            torch.testing.assert_close(self.per_layer_embedding._position_in_sequence, ids * 10)
++            assert self.per_layer_embedding._cp_packed_seq_params["ids"] is ids
++            return hidden_states * (ids.float().view(-1, 1, 1) + 1), kwargs["context"]
++
++    layer = _Layer()
++    block = SimpleNamespace(
++        _get_layer=lambda index: layer,
++        config=SimpleNamespace(
++            fp8=False, distribute_saved_activations=False, recompute_method="uniform", recompute_num_layers=1
++        ),
++        num_layers_per_pipeline_rank=1,
++        pre_process=False,
++    )
++    monkeypatch.setattr(
++        block_module.tensor_parallel,
++        "checkpoint",
++        lambda forward_func, _distribute_saved_activations, *args: checkpoint(forward_func, *args, use_reentrant=True),
++    )
++
++    def run_forward(token_values):
++        ids = torch.tensor(token_values)
++        ple._ngram_ids = ids
++        ple._position_in_sequence = ids * 10
++        ple._cp_packed_seq_params = {"ids": ids}
++        hidden_states = torch.ones(len(token_values), 1, 1, requires_grad=True)
++        output = Qwen3VLTransformerBlock._checkpointed_forward(
++            block,
++            hidden_states=hidden_states,
++            attention_mask=None,
++            context=None,
++            context_mask=None,
++            rotary_pos_emb=None,
++            attention_bias=None,
++            packed_seq_params=None,
++            padding_mask=None,
++            use_inner_fp8_context=False,
++        )
++        return hidden_states, output
++
++    first_hidden, first_output = run_forward([1, 2, 3])
++    run_forward(second_ids)
++    later_ids = ple._ngram_ids
++    first_output.sum().backward()
++
++    torch.testing.assert_close(first_hidden.grad.flatten(), torch.tensor([2.0, 3.0, 4.0]))
++    assert ple._ngram_ids is later_ids
++
++
+ @pytest.fixture(scope="module")
+ def transformer_config():
+     """Create a basic transformer config for testing."""

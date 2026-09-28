@@ -37,8 +37,48 @@ logger = get_logger(__name__)
 
 _NON_BLOCKING = device_utils.use_non_blocking_copy()
 
-# Weight names that must appear in the same chunk for SGLang's MLA fusion.
-_MLA_PAIRED_SUFFIXES = ("q_a_proj.weight", "kv_a_proj_with_mqa.weight")
+# Name fragments that SGLang fuses pairwise inside a single load_weights() call,
+# so both halves must land in the same sync chunk:
+#   - MLA HF-style : q_a_proj + kv_a_proj_with_mqa -> fused_qkv_a_proj_with_mqa
+#   - MLA DSv4-native: wq_a + wkv -> wqkv_a (deepseek_v4.py `fuse_wqa_wkv`)
+#   - DSv4 compressor: wkv + wgate (deepseek_v4.py COMPRESSOR_PART)
+# Each of those asserts its pending-pair cache is empty when the call ends.
+#
+# Matching replaces the fragment with a sentinel, so the REST of the name -- the
+# `.weight` vs `.weight_scale_inv` tail included -- becomes the pairing key. That
+# matters: quantize_params_fp8 emits weight and scale adjacently, so keying on a
+# stripped suffix alone would pair wq_a.weight with wq_a.weight_scale_inv instead
+# of with its wkv counterpart.
+#
+# Longest fragment wins, because ".wkv." is a substring of ".compressor.wkv.".
+_FUSED_PAIR_FRAGMENTS = (
+    (".q_a_proj.", ".kv_a_proj_with_mqa."),
+    (".wq_a.", ".wkv."),
+    (".compressor.wkv.", ".compressor.wgate."),
+)
+_PAIR_SENTINEL = "\x00"
+_QWEN4EXP_PLE_TABLE_SUFFIX = ".per_layer_embedding.ple_embedding.ngram_embedding.weight"
+
+
+def _fused_pair_key(name: str) -> str | None:
+    """Key that both halves of a fused pair map to, or None if `name` is not
+    one.
+
+    The sentinel carries the pair index, because two different families can
+    leave identical text around their fragment: replacing ".wq_a." in
+    `layers.N.attn.wq_a.weight` and ".compressor.wkv." in
+    `layers.N.attn.compressor.wkv.weight` both yield `layers.N.attn<S>weight`,
+    which would let a q_a half pair with a compressor half.
+    """
+    best = None  # (fragment, pair_index)
+    for index, pair in enumerate(_FUSED_PAIR_FRAGMENTS):
+        for fragment in pair:
+            if fragment in name and (best is None or len(fragment) > len(best[0])):
+                best = (fragment, index)
+    if best is None:
+        return None
+    fragment, index = best
+    return name.replace(fragment, f"{_PAIR_SENTINEL}{index}{_PAIR_SENTINEL}", 1)
 
 
 class HfWeightIteratorBridge(HfWeightIteratorBase):
@@ -132,6 +172,22 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             t_bcast_total += t_b1 - t_b0
 
             for info, param in zip(bucket_infos, params, strict=True):
+                if info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                    # Bridge's PLE mapping assembles one HF shard per TP collective.
+                    # A full TP gather here would materialize the entire n-gram
+                    # table (and convert() would retain all its shard views).
+                    shards = self._bridge_converter.iter_ple_shards(info.name, param)
+                    while True:
+                        t_g0 = time.monotonic()
+                        try:
+                            converted = next(shards)
+                        except StopIteration:
+                            break
+                        t_convert_total += time.monotonic() - t_g0
+                        param_count += 1
+                        yield converted
+                    continue
+
                 t_g0 = time.monotonic()
                 gathered = all_gather_param(self.args, info.name, param)
                 t_g1 = time.monotonic()

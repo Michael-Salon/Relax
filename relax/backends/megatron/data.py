@@ -328,7 +328,11 @@ def get_batch(
         return batch
 
     if pack_device is not None:
-        for key, dtype in (("tokens", torch.long), ("loss_masks", torch.int)):
+        for key, dtype in (
+            ("tokens", torch.long),
+            ("loss_masks", torch.int),
+            ("pre_shifted_labels", torch.long),
+        ):
             values = batch.get(key)
             if values is not None:
                 batch[key] = [torch.as_tensor(value, dtype=dtype, device=pack_device) for value in values]
@@ -357,11 +361,26 @@ def get_batch(
 
     tokens = batch["tokens"]
     batch_device = pack_device or tokens[0].device
+    qsa_stage2_enabled = (getattr(get_args(), "qsa_indexer_loss_coeff", 0.0) or 0.0) > 0
+    if qsa_stage2_enabled and allgather_cp and cp_size > 1:
+        raise NotImplementedError("QSA Stage-2 CP requires per-document zigzag packing, not allgather CP")
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
+    pre_shifted_labels = batch.get("pre_shifted_labels")
+    if pre_shifted_labels is not None:
+        args = get_args()
+        if args.loss_type != "sft":
+            raise ValueError("pre-shifted labels are only supported for SFT")
+        if cp_size != 1:
+            raise ValueError("pre-shifted SFT labels currently require context_parallel_size=1")
+        if getattr(args, "enable_mtp_training", False):
+            raise ValueError("pre-shifted SFT labels are incompatible with MTP")
+        if any(label.shape != token.shape for label, token in zip(pre_shifted_labels, tokens, strict=True)):
+            raise ValueError("pre-shifted labels and tokens must have identical per-sample shapes")
+        batch["unconcat_pre_shifted_labels"] = pre_shifted_labels
 
     if qkv_format == "bshd":
         max_seqlen = batch["max_seq_lens"][0]
@@ -423,6 +442,16 @@ def get_batch(
                 cu_seqlens_q_padded=cu_seqlens_padded,
                 cu_seqlens_kv_padded=cu_seqlens_padded,
             )
+            if qsa_stage2_enabled:
+                # Keep the attention/CP boundaries physical. Stage-2 QSA uses
+                # these original lengths to exclude trailing pad queries.
+                vlm_packed_seq_params.qsa_stage2_valid_lengths = torch.tensor(
+                    seqlens, dtype=torch.int32, device=device
+                )
+                physical_starts = [0]
+                for length in seqlens_padded:
+                    physical_starts.append(physical_starts[-1] + length)
+                vlm_packed_seq_params.qsa_stage2_layout_cpu = (tuple(physical_starts), tuple(seqlens))
             if use_dynamic_context_parallel:
                 vlm_packed_seq_params.local_cp_size = cp_size
                 vlm_packed_seq_params.cp_group = cp_group
@@ -481,6 +510,22 @@ def get_batch(
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
         )
+        if qsa_stage2_enabled:
+            valid_lengths = [int(sample.size(0)) for sample in batch["unconcat_tokens"]]
+            physical_cu = cu_seqlens_padded if allgather_cp else cu_seqlens
+            extra_segments = physical_cu.numel() - 1 - len(valid_lengths)
+            if extra_segments not in (0, 1) or (extra_segments == 1 and pad == 0):
+                raise ValueError("QSA Stage-2 requires one physical segment per sample plus optional tail padding.")
+            valid_lengths.extend([0] * extra_segments)
+            packed_seq_params.qsa_stage2_valid_lengths = torch.tensor(
+                valid_lengths, dtype=torch.int32, device=batch_device
+            )
+            physical_starts = list(cu_seqlens_cpu)
+            if allgather_cp:
+                # The all-gather layout extends the last document's physical end
+                # instead of adding a padding-only segment.
+                physical_starts[-1] += pad
+            packed_seq_params.qsa_stage2_layout_cpu = (tuple(physical_starts), tuple(valid_lengths))
         # Python boundaries let attention implementations iterate packed
         # subsequences without synchronizing individual accelerator scalars.
         packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_cpu
@@ -503,7 +548,11 @@ def get_batch(
     for loss_mask, total_length, response_length in zip(
         batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True
     ):
-        if response_length == total_length:
+        if pre_shifted_labels is not None:
+            if response_length != total_length:
+                raise ValueError("pre-shifted SFT labels require response_length == total_length")
+            per_sample_loss_masks.append(loss_mask)
+        elif response_length == total_length:
             loss_mask = align_loss_mask_for_sft(loss_mask)
             per_sample_loss_masks.append(loss_mask)
         else:
@@ -518,6 +567,10 @@ def get_batch(
                 loss_mask, 0, qkv_format, max_seqlen, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank
             )
         loss_masks.append(loss_mask)
+    if pre_shifted_labels is not None:
+        for loss_mask, labels in zip(full_per_sample_loss_masks, pre_shifted_labels, strict=True):
+            if not torch.equal(loss_mask.bool(), labels.ne(-100)):
+                raise ValueError("pre-shifted SFT loss mask must equal labels != -100")
     batch["loss_masks"] = per_sample_loss_masks
 
     if qkv_format == "bshd":

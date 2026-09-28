@@ -18,6 +18,7 @@ here.
 from argparse import Namespace
 
 import pytest
+import torch
 
 
 try:
@@ -45,7 +46,7 @@ def _mk_rl_forward_kwargs(loss_mask: object) -> dict:
 
 
 def test_rl_actor_forward_keeps_response_only_loss_mask():
-    tokens = object()
+    tokens = torch.tensor([[1, 2, 3, 4]])
     response_only_mask = object()  # full_loss_masks: prompt tokens zeroed for GRPO
     batch = {"tokens": tokens, "full_loss_masks": response_only_mask}
     forward_kwargs = _mk_rl_forward_kwargs(loss_mask=response_only_mask)
@@ -53,7 +54,7 @@ def test_rl_actor_forward_keeps_response_only_loss_mask():
     _attach_mtp_forward_kwargs(_mk_args(enable_mtp_training=True), batch, forward_kwargs)
 
     # MTP head trains on next-token prediction of the rollout response tokens.
-    assert forward_kwargs["mtp_kwargs"]["mtp_labels"] is tokens
+    torch.testing.assert_close(forward_kwargs["mtp_kwargs"]["mtp_labels"], torch.tensor([[2, 3, 4, 0]]))
     # GRPO's loss_mask must not be overwritten — it's the response-only mask the
     # external policy loss reads from batch["full_loss_masks"].
     assert forward_kwargs["loss_mask"] is response_only_mask
@@ -67,7 +68,7 @@ def test_rl_vlm_unsplit_loss_mask_none_is_preserved():
     # backfill full_loss_masks here, otherwise the patched process_mtp_loss would
     # see an inconsistent (labels=None, loss_mask=not-None) state and the MTP
     # branch in Megatron would receive a misshapen mask vs the unsplit tokens.
-    tokens = object()
+    tokens = torch.tensor([[1, 2, 3, 4]])
     full_loss_masks = object()
     batch = {"tokens": tokens, "full_loss_masks": full_loss_masks}
     forward_kwargs = _mk_rl_forward_kwargs(loss_mask=None)
@@ -78,12 +79,9 @@ def test_rl_vlm_unsplit_loss_mask_none_is_preserved():
     _attach_mtp_forward_kwargs(_mk_args(enable_mtp_training=True), batch, forward_kwargs)
 
     # _attach backfills loss_mask only when it's None on entry (model.py:49-50).
-    # That's correct for SFT; for the VLM unsplit branch the caller has already
-    # decided None is intentional. The current implementation backfills
-    # unconditionally on None — that's acceptable because VLM+MTP is not a
-    # supported combination yet (see Phase-2 roadmap). This test pins the
-    # current behavior so any future MTP+VLM work has a deliberate hand-off.
-    assert forward_kwargs["mtp_kwargs"]["mtp_labels"] is tokens
+    # The unsplit VL+THD+CP path supplies its own local labels/mask; this
+    # fallback path still backfills the ordinary aligned mask.
+    torch.testing.assert_close(forward_kwargs["mtp_kwargs"]["mtp_labels"], torch.tensor([[2, 3, 4, 0]]))
     assert forward_kwargs["loss_mask"] is full_loss_masks
 
 

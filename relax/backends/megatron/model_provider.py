@@ -21,6 +21,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
@@ -58,15 +59,23 @@ logger = get_logger(__name__)
 def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
     """Propagate MTP detach-path settings to every Megatron model config."""
     detach_paths = frozenset(getattr(args, "mtp_detach_paths", ("embedding", "backbone", "lm-head")))
+    detach_all_paths = {"embedding", "backbone", "lm-head"}.issubset(detach_paths)
     seen_configs: set[int] = set()
     for module in model.modules():
         config = getattr(module, "config", None)
-        if config is None or id(config) in seen_configs:
-            continue
-        setattr(config, "mtp_detach_embedding", "embedding" in detach_paths)
-        setattr(config, "mtp_detach_backbone", "backbone" in detach_paths)
-        setattr(config, "mtp_detach_lm_head", "lm-head" in detach_paths)
-        seen_configs.add(id(config))
+        if config is not None and id(config) not in seen_configs:
+            setattr(config, "mtp_detach_embedding", "embedding" in detach_paths)
+            setattr(config, "mtp_detach_backbone", "backbone" in detach_paths)
+            setattr(config, "mtp_detach_lm_head", "lm-head" in detach_paths)
+            setattr(config, "mtp_detach_heads", detach_all_paths)
+            seen_configs.add(id(config))
+
+        if isinstance(module, MultiTokenPredictionBlock):
+            for param in module.parameters():
+                if detach_all_paths:
+                    param.grad_norm_group = "mtp"
+                elif getattr(param, "grad_norm_group", None) == "mtp":
+                    del param.grad_norm_group
 
 
 def _make_json_safe(value: Any, seen: set[int] | None = None) -> Any:
@@ -293,11 +302,15 @@ def get_model_provider_func(
             "pipeline_model_parallel_size",
             "virtual_pipeline_model_parallel_size",
             "context_parallel_size",
+            "cp_comm_type",
+            "cp_partition_mode",
+            "sequence_packing_scheduler",
             "linear_cp_mode",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "variable_seq_lengths",
             "dsa_indexer_loss_coeff",
+            "qsa_indexer_loss_coeff",
             "dsa_indexer_use_sparse_loss",
             "attention_softmax_in_fp32",
             "masked_softmax_fusion",
@@ -315,6 +328,7 @@ def get_model_provider_func(
             "moe_shared_expert_overlap",
             "moe_enable_deepep",
             "moe_flex_dispatcher_backend",
+            "moe_hybridep_pad_uneven_dispatch_inputs",
             "use_audio_in_video",
             "freeze_language_model",
             "freeze_vision_model",
@@ -370,6 +384,8 @@ def get_model_provider_func(
             if attr in args_dict and attr in bridge_keys:
                 old_val = getattr(provider, attr)
                 new_val = args_dict[attr]
+                if attr == "cp_comm_type" and isinstance(new_val, list) and len(new_val) == 1:
+                    new_val = new_val[0]
                 if getattr(args, "dynamic_context_parallel", False):
                     if attr == "dynamic_context_parallel":
                         new_val = False

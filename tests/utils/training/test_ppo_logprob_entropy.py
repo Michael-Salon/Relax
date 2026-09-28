@@ -8,6 +8,7 @@ import socket
 import pytest
 import torch
 
+from relax.utils.training import ppo_utils
 from relax.utils.training.ppo_utils import calculate_log_probs_and_entropy
 
 
@@ -263,6 +264,68 @@ def test_calculate_log_probs_and_entropy_matches_unfused_reference_single_rank(
     torch.testing.assert_close(logits.grad, expected_grad, rtol=STRICT_RTOL, atol=STRICT_ATOL)
 
 
+@pytest.mark.parametrize("with_mask", [False, True])
+@pytest.mark.parametrize("with_entropy", [False, True])
+@pytest.mark.parametrize("chunk_size", [-1, 2])
+def test_logprob_fast_path_matches_default_forward_and_backward(
+    monkeypatch: pytest.MonkeyPatch, with_mask: bool, with_entropy: bool, chunk_size: int
+) -> None:
+    tokens = torch.tensor([3, 0, 1], dtype=torch.long)
+    keep_mask = _single_rank_keep_mask() if with_mask else None
+    logprob_weights = torch.tensor([0.25, -0.5, 1.5], dtype=torch.float32)
+    entropy_weights = torch.tensor([0.55, -0.2, 1.8], dtype=torch.float32)
+    results = []
+
+    for enabled in (False, True):
+        monkeypatch.setattr(ppo_utils, "_LOGPROB_FAST_PATH", enabled)
+        logits = _single_rank_logits().requires_grad_()
+        log_probs, entropy = calculate_log_probs_and_entropy(
+            logits,
+            tokens,
+            tp_group=None,
+            with_entropy=with_entropy,
+            chunk_size=chunk_size,
+            log_prob_keep_mask=keep_mask,
+        )
+        _weighted_loss(
+            log_probs,
+            entropy,
+            logprob_weights=logprob_weights,
+            entropy_weights=entropy_weights,
+        ).backward()
+        results.append((log_probs.detach(), entropy.detach() if entropy is not None else None, logits.grad))
+
+    default_log_probs, default_entropy, default_grad = results[0]
+    fast_log_probs, fast_entropy, fast_grad = results[1]
+    torch.testing.assert_close(fast_log_probs, default_log_probs, rtol=STRICT_RTOL, atol=STRICT_ATOL)
+    if with_entropy:
+        torch.testing.assert_close(fast_entropy, default_entropy, rtol=STRICT_RTOL, atol=STRICT_ATOL)
+    else:
+        assert fast_entropy is default_entropy is None
+    torch.testing.assert_close(fast_grad, default_grad, rtol=1e-6, atol=1e-7)
+
+
+def test_logprob_fast_path_skips_single_rank_all_reduce(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(ppo_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(ppo_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(ppo_utils.dist, "all_reduce", lambda tensor, op, group: calls.append((op, group)))
+    monkeypatch.setattr(ppo_utils, "_get_vocab_parallel_rank_size", lambda group: (0, 1))
+    tensor = torch.ones(1)
+
+    monkeypatch.setattr(ppo_utils, "_LOGPROB_FAST_PATH", False)
+    ppo_utils._maybe_all_reduce(tensor, ppo_utils.dist.ReduceOp.SUM, None)
+    assert len(calls) == 1
+
+    monkeypatch.setattr(ppo_utils, "_LOGPROB_FAST_PATH", True)
+    ppo_utils._maybe_all_reduce(tensor, ppo_utils.dist.ReduceOp.SUM, None)
+    assert len(calls) == 1
+
+    monkeypatch.setattr(ppo_utils, "_get_vocab_parallel_rank_size", lambda group: (0, 2))
+    ppo_utils._maybe_all_reduce(tensor, ppo_utils.dist.ReduceOp.SUM, None)
+    assert len(calls) == 2
+
+
 def test_metric_only_entropy_does_not_save_entropy_backward_tensors() -> None:
     logits = _single_rank_logits().requires_grad_()
     tokens = torch.tensor([3, 0, 1], dtype=torch.long)
@@ -343,6 +406,7 @@ def _distributed_vocab_worker(
     with_mask: bool,
     with_entropy: bool,
     chunk_size: int,
+    fast_path: bool,
     master_port: int,
 ) -> None:
     import torch.distributed as dist
@@ -352,6 +416,7 @@ def _distributed_vocab_worker(
     os.environ["MASTER_PORT"] = str(master_port)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
     try:
+        ppo_utils._LOGPROB_FAST_PATH = fast_path
         full_logits = _distributed_full_logits()
         tokens = torch.tensor([5, 0, 3, 2], dtype=torch.long)
         full_keep_mask = _distributed_keep_mask() if with_mask else None
@@ -411,33 +476,35 @@ def _distributed_vocab_worker(
         torch.testing.assert_close(
             local_logits.grad,
             expected_grad[:, vocab_start:vocab_end],
-            rtol=STRICT_RTOL,
-            atol=STRICT_ATOL,
+            rtol=1e-6 if fast_path else STRICT_RTOL,
+            atol=1e-7 if fast_path else STRICT_ATOL,
         )
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(
-    "with_mask,with_entropy,chunk_size",
+    "with_mask,with_entropy,chunk_size,fast_path",
     [
-        pytest.param(False, True, -1, id="unmasked_entropy_no_chunks"),
-        pytest.param(True, True, 2, id="masked_entropy_chunks"),
-        pytest.param(True, False, -1, id="masked_logprob_only_no_chunks"),
-        pytest.param(False, False, 2, id="unmasked_logprob_only_chunks"),
+        pytest.param(False, True, -1, False, id="unmasked_entropy_no_chunks"),
+        pytest.param(True, True, 2, False, id="masked_entropy_chunks"),
+        pytest.param(True, False, -1, False, id="masked_logprob_only_no_chunks"),
+        pytest.param(False, False, 2, False, id="unmasked_logprob_only_chunks"),
+        pytest.param(True, False, 2, True, id="masked_logprob_fast_path_chunks"),
     ],
 )
 def test_calculate_log_probs_and_entropy_matches_unfused_reference_vocab_parallel(
     with_mask: bool,
     with_entropy: bool,
     chunk_size: int,
+    fast_path: bool,
 ):
     import torch.multiprocessing as mp
 
     world_size = 2
     mp.spawn(
         _distributed_vocab_worker,
-        args=(world_size, with_mask, with_entropy, chunk_size, _free_port()),
+        args=(world_size, with_mask, with_entropy, chunk_size, fast_path, _free_port()),
         nprocs=world_size,
         join=True,
     )

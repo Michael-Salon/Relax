@@ -2452,3 +2452,247 @@ index 6636d06a..53142e01 100644
          "torch_npu.",
      }
  
+diff --git a/python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py b/python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py
+index e2a60a21acf5..af01f8a11f06 100644
+--- a/python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py
++++ b/python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py
+@@ -134,7 +134,7 @@ def _dequantize_k_cache_fast_kernel(
+     DIM_NOPE: tl.constexpr,
+     DIM_ROPE: tl.constexpr,
+ ):
+-    token_id = tl.program_id(0)
++    token_id = tl.program_id(0).to(tl.int64)
+     raw_block_id = tl.program_id(1)
+ 
+     if raw_block_id < NUM_NOPE_BLOCKS:
+@@ -249,8 +249,8 @@ def _dequantize_k_cache_paged_kernel(
+     DIM_NOPE: tl.constexpr,
+     DIM_ROPE: tl.constexpr,
+ ):
+-    token_id = tl.program_id(0)
+-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
++    token_id = tl.program_id(0).to(tl.int64)
++    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
+     raw_block_id = tl.program_id(1)
+ 
+     if raw_block_id < NUM_NOPE_BLOCKS:
+diff --git a/python/sglang/kernels/ops/attention/dsa/quant_k_cache.py b/python/sglang/kernels/ops/attention/dsa/quant_k_cache.py
+index 5454071b897d..adaa948e1ea8 100644
+--- a/python/sglang/kernels/ops/attention/dsa/quant_k_cache.py
++++ b/python/sglang/kernels/ops/attention/dsa/quant_k_cache.py
+@@ -283,7 +283,7 @@ def _quantize_k_cache_fast_kernel(
+     FP8_MIN: tl.constexpr,
+     FP8_MAX: tl.constexpr,
+ ):
+-    token_id = tl.program_id(0)
++    token_id = tl.program_id(0).to(tl.int64)
+     raw_block_id = tl.program_id(1)
+ 
+     if raw_block_id < NUM_NOPE_BLOCKS:
+diff --git a/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py b/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
+index 01ad58aadc08..a9b97a939613 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
++++ b/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
+@@ -105,7 +105,7 @@ def _dequantize_k_cache_paged_kernel(
+ ):
+     # One program per token: load page_table[token_id] once and emit all
+     # NUM_SCALE_TILES nope tiles + rope tail via tl.static_range.
+-    token_id = tl.program_id(0)
++    token_id = tl.program_id(0).to(tl.int64)
+     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+     page_idx = loc // PAGE_SIZE
+     in_page = loc % PAGE_SIZE
+diff --git a/python/sglang/kernels/ops/attention/dsv4/quant_k_cache.py b/python/sglang/kernels/ops/attention/dsv4/quant_k_cache.py
+index 21d44f33d3f6..6cca6be04761 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/quant_k_cache.py
++++ b/python/sglang/kernels/ops/attention/dsv4/quant_k_cache.py
+@@ -26,7 +26,7 @@ def _quant_k_cache_fused_kernel(
+     FP8_MAX: tl.constexpr,
+     EPS: tl.constexpr,
+ ):
+-    token_id = tl.program_id(0)
++    token_id = tl.program_id(0).to(tl.int64)
+     tile_id = tl.program_id(1)
+ 
+     if tile_id == NUM_TILES:
+diff --git a/python/sglang/srt/layers/quantization/mxfp4.py b/python/sglang/srt/layers/quantization/mxfp4.py
+index 131bec476da4..d1afa4ff21c3 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4.py
++++ b/python/sglang/srt/layers/quantization/mxfp4.py
+@@ -168,6 +168,16 @@ if _is_hip:
+         dynamic_mxfp4_quant = e8m0_shuffle = err
+ 
+ 
++def _pad_hopper_mxfp4_scale(scale, k_size):
++    # triton_kernels' HOPPER_SCALE branch (matmul_ogs_details/_matmul_ogs.py)
++    # loads weight scales unmasked over cdiv(k_size, 128) tiles.
++    mxfp4_block = 32
++    want = round_up(k_size, 128) // mxfp4_block
++    if scale.shape[-1] >= want:
++        return scale
++    return torch.nn.functional.pad(scale, (0, want - scale.shape[-1]), value=_UE8M0_ONE)
++
++
+ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
+     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+@@ -192,6 +202,8 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+             "split_k": 1,
+         }
+         opt_flags.update_opt_flags_constraints(constraints)
++        k_size = quant_tensor.shape[-1] * 2  # packed e2m1: 2 fp4 values per byte
++        scale = _pad_hopper_mxfp4_scale(scale=scale, k_size=k_size)
+     # transpose the tensor so that the quantization axis is on dim1
+     quant_tensor = quant_tensor.transpose(-2, -1)
+     scale = scale.transpose(-2, -1)
+diff --git a/python/sglang/srt/state_capturer/base.py b/python/sglang/srt/state_capturer/base.py
+index 7bedeb4451..6f6b875784 100644
+--- a/python/sglang/srt/state_capturer/base.py
++++ b/python/sglang/srt/state_capturer/base.py
+@@ -5,10 +5,19 @@ from typing import Optional
+ import torch
+ 
+ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
++from sglang.srt.mem_cache.pool_host.common import (
++    ALLOC_MEMORY_FUNCS,
++    HostTensorAllocator,
++    _cuda_host_unregister,
++)
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++from sglang.srt.utils import is_cuda, is_hip
+ 
+ logger = logging.getLogger(__name__)
+ 
++_is_cuda = is_cuda()
++_is_hip = is_hip()
++
+ _GB = 1024 * 1024 * 1024
+ _MB = 1024 * 1024
+ 
+@@ -52,19 +61,31 @@ class BaseDeviceCache:
+ 
+ 
+ class BaseHostCache:
+-    def __init__(self, num_tokens: int, num_layers: int, topk_size: int, name: str):
+-        self.buffer = torch.zeros(
++    def __init__(
++        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
++    ):
++        alloc = ALLOC_MEMORY_FUNCS[device]
++        self.buffer = alloc(
+             (num_tokens, num_layers, topk_size),
+             dtype=torch.int32,
+             device="cpu",
+             pin_memory=True,
++            allocator=HostTensorAllocator(),
+         )
++        self.buffer.zero_()
+         self.num_tokens = num_tokens
+         self.num_layers = num_layers
+         self.topk_size = topk_size
+         self.name = name
+         self._log_allocation()
+ 
++    def destroy(self):
++        if self.buffer is None:
++            return
++        if _is_cuda or _is_hip:
++            _cuda_host_unregister(self.buffer)
++        self.buffer = None
++
+     def get_buffer_size_bytes(self):
+         return get_tensor_size_bytes(self.buffer)
+ 
+@@ -115,7 +136,9 @@ class BaseTopkCapturer:
+         self.num_layers = num_layers
+         self.topk_size = topk_size
+ 
+-        self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
++        self.host_cache = BaseHostCache(
++            num_tokens, num_layers, topk_size, name=name, device=device
++        )
+         self.device_cache = BaseDeviceCache(
+             max_batch_size,
+             num_layers,
+@@ -127,6 +150,9 @@ class BaseTopkCapturer:
+     def capture(self, layer_id: int, topk_indices: torch.Tensor):
+         self.device_cache.capture(layer_id, topk_indices)
+ 
++    def destroy(self):
++        self.host_cache.destroy()
++
+     def _get_local_slice(
+         self,
+         forward_batch: ForwardBatch,
+@@ -176,9 +202,10 @@ class BaseTopkCapturer:
+             forward_batch, can_run_graph, cuda_graph_batch
+         )
+         if no_copy_to_cpu:
++            # Clone before the next overlapping forward reuses these buffers.
+             return TopkCaptureOutput(
+-                out_cache_loc=forward_batch.out_cache_loc,
+-                topk=slice_gpu,
++                out_cache_loc=forward_batch.out_cache_loc.clone(),
++                topk=slice_gpu.clone(),
+                 host_cache=self.host_cache,
+             )
+         out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
+diff --git a/python/sglang/srt/state_capturer/indexer_topk.py b/python/sglang/srt/state_capturer/indexer_topk.py
+index de55546489..cbbe070516 100644
+--- a/python/sglang/srt/state_capturer/indexer_topk.py
++++ b/python/sglang/srt/state_capturer/indexer_topk.py
+@@ -56,6 +56,12 @@ def set_global_indexer_capturer(capturer: Optional[IndexerTopkCapturer]):
+     get_resources().indexer_capturer = capturer
+ 
+ 
++def destroy_global_indexer_capturer():
++    if (capturer := get_global_indexer_capturer()) is not None:
++        capturer.destroy()
++    set_global_indexer_capturer(None)
++
++
+ def maybe_capture_indexer_topk(
+     layer_id: int, topk_indices: Optional[torch.Tensor]
+ ) -> Optional[torch.Tensor]:
+diff --git a/python/sglang/srt/state_capturer/routed_experts.py b/python/sglang/srt/state_capturer/routed_experts.py
+index 1207b13f95..9619f12e14 100644
+--- a/python/sglang/srt/state_capturer/routed_experts.py
++++ b/python/sglang/srt/state_capturer/routed_experts.py
+@@ -149,6 +149,12 @@ def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
+     get_resources().experts_capturer = capturer
+ 
+ 
++def destroy_global_experts_capturer():
++    if (capturer := get_global_experts_capturer()) is not None:
++        capturer.destroy()
++    set_global_experts_capturer(None)
++
++
+ def extract_routed_experts_from_meta_info(data):
+     # To solve the performance issue, we return the experts_ids in base64
+     # We left this function for user to change it back to normal int32
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index 15b84ed239..670ecd3ea6 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -240,7 +240,10 @@
+         return config.num_hidden_layers
+     if is_deepseek_v4(config):
+         compress_ratios = getattr(config, "compress_ratios", None) or []
+-        return sum(1 for r in compress_ratios if r == 4)
++        # Reduced checkpoints can retain trailing ratios from the full model.
++        return sum(
++            1 for r in compress_ratios[: config.num_hidden_layers] if r == 4
++        )
+     return getattr(config, "num_indexer_layers", 0)
+ 
+ 
+diff --git a/python/sglang/srt/configs/qwen3_asr.py b/python/sglang/srt/configs/qwen3_asr.py
+index cb3252b3d47cc35ed51fda77803d31ec604c8d6c..bf2ce3a0742514e4fd8028a1750af22ac279af67 100644
+--- a/python/sglang/srt/configs/qwen3_asr.py
++++ b/python/sglang/srt/configs/qwen3_asr.py
+@@ -167,2 +167,2 @@ class Qwen3ASRConfig(PretrainedConfig):
+-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
+-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
++AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
++AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig, exist_ok=True)

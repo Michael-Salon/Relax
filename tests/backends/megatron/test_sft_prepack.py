@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
+from threading import Event
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -92,6 +94,61 @@ def test_sft_train_prefetch_all_success_keeps_payload(monkeypatch):
     assert actor_module._agree_sft_train_prefetch_result(payload, None) is payload
 
 
+def test_sft_train_prefetch_polls_same_partition_until_ready(monkeypatch):
+    empty = [None, SimpleNamespace(size=0)]
+    ready = ["payload", SimpleNamespace(size=2)]
+    fetch = MagicMock(side_effect=[(empty, 0.01), (empty, 0.01), (ready, 0.02)])
+    monkeypatch.setattr(actor_module, "fetch_data_from_transfer_queue", fetch)
+    stop_event = MagicMock()
+    stop_event.is_set.return_value = False
+
+    payload, elapsed = actor_module._fetch_sft_train_payload_until_ready(
+        stop_event=stop_event,
+        timeout_s=10,
+        tq_client=object(),
+        data_fields=["tokens"],
+        batch_size=256,
+        partition_id="sft_1",
+        task_name="sft_train",
+        sampling_config={"dp_rank": 0, "task_name": "sft_train"},
+        batch_index=0,
+    )
+
+    assert payload is ready
+    assert elapsed >= 0
+    assert fetch.call_count == 3
+    assert fetch.call_args_list[0] == fetch.call_args_list[1] == fetch.call_args_list[2]
+    assert stop_event.wait.call_count == 2
+
+
+def test_sft_train_prefetch_stop_and_deadline_do_not_read_extra_batches(monkeypatch):
+    fetch = MagicMock(return_value=([None, SimpleNamespace(size=0)], 0.01))
+    monkeypatch.setattr(actor_module, "fetch_data_from_transfer_queue", fetch)
+    kwargs = dict(
+        tq_client=object(),
+        data_fields=["tokens"],
+        batch_size=256,
+        partition_id="sft_1",
+        task_name="sft_train",
+        sampling_config={"dp_rank": 0, "task_name": "sft_train"},
+        batch_index=0,
+    )
+    stopped = Event()
+    stopped.set()
+    with pytest.raises(RuntimeError, match="cancelled"):
+        actor_module._fetch_sft_train_payload_until_ready(stop_event=stopped, timeout_s=10, **kwargs)
+    fetch.assert_not_called()
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        actor_module._fetch_sft_train_payload_until_ready(stop_event=Event(), timeout_s=0, **kwargs)
+    assert fetch.call_count == 1
+
+    fetch.return_value = (["payload", SimpleNamespace(size=2)], 0.01)
+    payload, _ = actor_module._fetch_sft_train_payload_until_ready(stop_event=Event(), timeout_s=0, **kwargs)
+    assert payload[0] == "payload"
+    assert fetch.call_count == 2
+
+
 def test_sft_train_prefetch_peer_fatal_raises_together(monkeypatch):
     def mark_peer_fatal(state, *, op, group):
         if group == "tp_cp":
@@ -149,12 +206,16 @@ def test_sft_train_prefetch_shutdown_is_idempotent():
     actor._sft_train_prefetch = future
     actor._sft_train_prefetch_rollout_id = 3
     actor._sft_train_prefetch_executor = executor
+    stop_event = MagicMock()
+    actor._sft_train_prefetch_stop = stop_event
 
     actor._shutdown_sft_train_prefetch()
     actor._shutdown_sft_train_prefetch()
 
     future.cancel.assert_called_once_with()
     executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+    stop_event.set.assert_called_once_with()
+    assert actor._sft_train_prefetch_stop is None
 
 
 def test_sft_prepack_fetch_concatenates_ready_tq_shards(monkeypatch):

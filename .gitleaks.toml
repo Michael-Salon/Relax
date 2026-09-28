@@ -105,6 +105,8 @@ tags = ["internal", "ip", "private"]
 # Allowlist: Ignore scanner metadata and generated docs artifacts
 [allowlist]
 description = "Ignore scanner metadata and generated docs artifacts"
+# Official Transformers API class in the pinned source patch, not a credential.
+stopwords = ['''Qwen4ExpForCausalLM''']
 paths = [
   '''\.gitleaks\.toml$''',
   '''docs/Dockerfile''',

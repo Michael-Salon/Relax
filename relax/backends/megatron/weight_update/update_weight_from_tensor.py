@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
@@ -30,6 +31,7 @@ from relax.utils.megatron_peft_utils import (
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .lora_adapter_sync import LoraAdapterSync
+from .qwen4_sync_producer_audit import Qwen4SyncProducerAudit
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
@@ -194,14 +196,38 @@ class UpdateWeightFromTensor:
 
         self.weight_version += 1
 
-        # Pause/flush must cover both IPC and distributed-broadcast engines,
-        # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
+        audit_dir = os.environ.get("RELAX_QWEN4_SYNC_AUDIT_DIR")
+        producer_audit = None
+        if audit_dir:
+            if (
+                self._ipc_engine is not None
+                and len(self.rollout_engines) == 1
+                and not self.distributed_rollout_engines
+            ):
+                try:
+                    tp_rank = dist.get_rank(group=self._ipc_gather_group)
+                    producer_audit = Qwen4SyncProducerAudit(
+                        audit_dir, self.weight_version, dist.get_rank(group=dist.group.WORLD), tp_rank
+                    )
+                except Exception:
+                    logger.exception(
+                        "Qwen4 producer audit initialization failed; no completion manifest will be written"
+                    )
+            elif dist.get_rank(group=dist.group.WORLD) == 0:
+                logger.warning(
+                    "Qwen4 producer audit requires exactly one colocated IPC engine; no manifest on this rank"
+                )
+
+        # Pause/flush must cover both IPC and distributed-broadcast engines.
+        # Offloaded engines already flushed before releasing KV memory; another
+        # flush now would write into that still-unmapped KV pool.
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
 
         rank = dist.get_rank()
         if rank == 0:
             ray.get([engine.pause_generation.remote() for engine in all_engines])
-            ray.get([engine.flush_cache.remote() for engine in all_engines])
+            if not self.args.offload_rollout:
+                ray.get([engine.flush_cache.remote() for engine in all_engines])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=True,
@@ -243,6 +269,14 @@ class UpdateWeightFromTensor:
         prev_long_lived_tensors = None
         with export_ctx:
             for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                if producer_audit is not None:
+                    try:
+                        producer_audit.record_bucket(hf_named_tensors)
+                    except Exception:
+                        logger.exception(
+                            "Qwen4 producer audit failed to record a bucket; no completion manifest will be written"
+                        )
+                        producer_audit = None
                 refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
                 # Wait for the *previous* chunk's IPC to finish before
                 # releasing its GPU tensors.
@@ -274,6 +308,13 @@ class UpdateWeightFromTensor:
                 )
             ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
+        if producer_audit is not None:
+            try:
+                producer_audit.complete()
+            except Exception:
+                # This opt-in audit is diagnostic. Missing completion files fail
+                # external acceptance without invalidating a successful sync.
+                logger.exception("Qwen4 producer audit could not persist completion manifest")
 
     def _update_weights_adapter_mode(self) -> None:
         """LoRA adapter mode: sync base once, then push only the adapter each
@@ -308,7 +349,8 @@ class UpdateWeightFromTensor:
         rank = dist.get_rank()
         if rank == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            if not self.args.offload_rollout:
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=True,
@@ -407,7 +449,8 @@ class UpdateWeightFromTensor:
         rank = dist.get_rank()
         if rank == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            if not self.args.offload_rollout:
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
         push_error: Exception | None = None

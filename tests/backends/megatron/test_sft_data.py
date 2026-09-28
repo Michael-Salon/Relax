@@ -1,10 +1,36 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""SFT-specific paths in megatron data.py."""
+"""SFT-specific paths in Megatron data and loss handling."""
+
+from argparse import Namespace
 
 import torch
 
 from relax.utils.sft_utils import align_loss_mask_for_sft as _align_loss_mask_for_sft
+
+
+def test_get_responses_uses_all_pre_shifted_labels(monkeypatch):
+    from relax.backends.megatron import loss as loss_module
+
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    logits = torch.arange(15, dtype=torch.float32).reshape(1, 3, 5)
+    labels = torch.tensor([-100, 4, 2], dtype=torch.long)
+
+    chunks = list(
+        loss_module.get_responses(
+            logits,
+            args=Namespace(qkv_format="thd", loss_type="sft", rollout_temperature=1.0),
+            unconcat_tokens=[torch.tensor([10, 11, 12])],
+            total_lengths=[3],
+            response_lengths=[3],
+            pre_shifted_labels=[labels],
+        )
+    )
+
+    assert len(chunks) == 1
+    logits_chunk, tokens_chunk = chunks[0]
+    assert torch.equal(logits_chunk, logits.squeeze(0))
+    assert tokens_chunk.tolist() == [0, 4, 2]
 
 
 def test_align_loss_mask_for_sft_left_shift_one():

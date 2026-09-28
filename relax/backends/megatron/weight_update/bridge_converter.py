@@ -3,7 +3,7 @@
 import dataclasses
 import re
 from argparse import Namespace
-from collections.abc import Sequence
+from collections.abc import Collection, Iterator, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -239,6 +239,67 @@ class BridgeConverter:
     # ------------------------------------------------------------------
     # Per-parameter conversion
     # ------------------------------------------------------------------
+
+    def _convert_hc_alpha(self, name, global_name, param, task, match) -> list[tuple[str, torch.Tensor]]:
+        """Buffer DSv4 mHC alphas and emit `hc_*_scale` once all three arrived.
+
+        Returns an empty list for the first two alphas of a group; the third
+        one emits ``{hf_param: cat([pre, post, res])}``. Only the ``alpha_pre``
+        task carries the resolved HF name (the other two map to no-op
+        secondaries), so the name is remembered independently of arrival order.
+        """
+        group = match.group("group")
+        which = match.group("which")
+
+        hf_param = getattr(task.mapping, "hf_param", None)
+        if isinstance(hf_param, str) and hf_param:
+            self._hc_alpha_hf_name[group] = hf_param
+
+        buf = self._hc_alpha_buf.setdefault(group, {})
+        buf[which] = param.detach().reshape(-1).float()
+
+        if len(buf) < len(_HC_ALPHA_ORDER):
+            return []
+
+        hf_name = self._hc_alpha_hf_name.get(group)
+        self._hc_alpha_buf.pop(group, None)
+        if hf_name is None:
+            logger.warning(
+                "mHC alpha group %s completed but no HF name was seen; dropping (mapping=%s)",
+                group,
+                type(task.mapping).__name__,
+            )
+            return []
+        self._hc_alpha_hf_name.pop(group, None)
+        scale = torch.cat([buf[k] for k in _HC_ALPHA_ORDER])
+        return quantize_params(self._args, name, [(hf_name, scale)], self._quantization_config)
+
+    def iter_ple_shards(self, name: str, local_rows: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+        """Export a TP-sharded Qwen4Exp PLE table one HF shard at a time.
+
+        The Bridge mapping owns the TP all-reduce for each shard. All TP ranks
+        must consume this iterator in the same order.
+        """
+        from megatron.bridge.models.qwen.qwen4_exp_bridge import PLENGramEmbeddingMapping
+
+        self.init_tasks()
+        global_name, task = self._lookup_task(_normalize_global_name(name))
+        if task is None or not isinstance(task.mapping, PLENGramEmbeddingMapping):
+            raise ValueError(f"No Qwen4Exp PLE shard mapping for {global_name}")
+
+        mapping = task.mapping
+        # Relax has already broadcast this TP-local tensor over PP/EP. Preserve
+        # Bridge's TP group so _PLEShardExport.gather_shard can all-reduce rows.
+        pp_group = mapping.pp_group
+        mapping.pp_group = None
+        try:
+            shards = mapping.megatron_to_hf(local_rows, task.megatron_module)
+            for hf_name, shard in shards.items():
+                if self._hf_alias_checkpoint_keys is not None:
+                    hf_name = _resolve_hf_name_against_checkpoint(hf_name, self._hf_alias_checkpoint_keys)
+                yield from quantize_params(self._args, name, [(hf_name, shard)], self._quantization_config)
+        finally:
+            mapping.pp_group = pp_group
 
     def convert(self, name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         """Convert a single TP/EP-gathered parameter to HF format.

@@ -29,6 +29,7 @@ class _FakeProvider:
         self.bf16 = False
         self.params_dtype = None
         self.vision_dp_when_cp = False
+        self.qsa_indexer_loss_coeff = 0.0
 
     def finalize(self):
         self.finalized = True
@@ -56,6 +57,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     gpt = types.ModuleType("megatron.core.models.gpt")
     gpt_layer_specs = types.ModuleType("megatron.core.models.gpt.gpt_layer_specs")
     transformer = types.ModuleType("megatron.core.transformer")
+    multi_token_prediction = types.ModuleType("megatron.core.transformer.multi_token_prediction")
     spec_utils = types.ModuleType("megatron.core.transformer.spec_utils")
     transformer_config = types.ModuleType("megatron.core.transformer.transformer_config")
     training = types.ModuleType("megatron.training")
@@ -69,6 +71,9 @@ def _install_fake_megatron(monkeypatch, provider=None):
         pass
 
     class _FakeTransformerConfig:
+        pass
+
+    class _FakeMultiTokenPredictionBlock:
         pass
 
     class _FakeAutoBridge:
@@ -93,6 +98,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     gpt_layer_specs.get_gpt_layer_with_transformer_engine_spec = lambda *args, **kwargs: object()
     spec_utils.import_module = lambda path: object()
     transformer_config.TransformerConfig = _FakeTransformerConfig
+    multi_token_prediction.MultiTokenPredictionBlock = _FakeMultiTokenPredictionBlock
     arguments.core_transformer_config_from_args = lambda args: _FakeTransformerConfig()
     arguments.parse_args = lambda *args, **kwargs: None
     arguments.validate_args = lambda *args, **kwargs: None
@@ -110,6 +116,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
         "megatron.core.models.gpt": gpt,
         "megatron.core.models.gpt.gpt_layer_specs": gpt_layer_specs,
         "megatron.core.transformer": transformer,
+        "megatron.core.transformer.multi_token_prediction": multi_token_prediction,
         "megatron.core.transformer.spec_utils": spec_utils,
         "megatron.core.transformer.transformer_config": transformer_config,
         "megatron.training": training,
@@ -148,6 +155,7 @@ def _bridge_args(**overrides):
         "expert_tensor_parallel_size": 1,
         "variable_seq_lengths": True,
         "dsa_indexer_loss_coeff": None,
+        "qsa_indexer_loss_coeff": 0.0,
         "dsa_indexer_use_sparse_loss": None,
         "attention_softmax_in_fp32": True,
         "bias_dropout_fusion": True,
@@ -200,6 +208,15 @@ def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
     model_provider(pre_process=True, post_process=True)
 
     assert provider.vision_dp_when_cp is True
+
+
+def test_bridge_provider_receives_qsa_indexer_loss_coeff(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    model_provider = module.get_model_provider_func(_bridge_args(qsa_indexer_loss_coeff=0.01), role="actor")
+    model_provider(pre_process=True, post_process=True)
+
+    assert provider.qsa_indexer_loss_coeff == pytest.approx(0.01)
 
 
 def test_bridge_provider_maps_legacy_vision_dp_when_tp_to_cp(monkeypatch):
@@ -501,3 +518,44 @@ def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):
     wrapped_provider(pre_process=True, post_process=False)
 
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+@pytest.mark.parametrize("cp_comm_type", ["p2p", "a2a", ["p2p"], ["a2a"], ["p2p", "a2a"] * 30])
+def test_bridge_provider_preserves_requested_cp_communication_after_finalize(monkeypatch, cp_comm_type):
+    provider = _FakeProvider()
+    provider.cp_comm_type = "p2p"
+    provider.num_layers = 60
+    original_finalize = provider.finalize
+
+    def validate_and_finalize():
+        if isinstance(provider.cp_comm_type, list):
+            assert len(provider.cp_comm_type) == provider.num_layers
+        original_finalize()
+
+    provider.finalize = validate_and_finalize
+    module, provider = _load_model_provider(monkeypatch, provider)
+    build_model = module.get_model_provider_func(
+        _bridge_args(cp_comm_type=cp_comm_type, context_parallel_size=4, num_layers=60), role="actor"
+    )
+    build_model(pre_process=True, post_process=True)
+    assert provider.finalized
+    expected = cp_comm_type[0] if isinstance(cp_comm_type, list) and len(cp_comm_type) == 1 else cp_comm_type
+    assert provider.cp_comm_type == expected
+
+
+def test_bridge_provider_forwards_hybridep_uneven_token_padding(monkeypatch):
+    provider = _FakeProvider()
+    provider.moe_hybridep_pad_uneven_dispatch_inputs = False
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(moe_hybridep_pad_uneven_dispatch_inputs=True), role="actor")
+    assert provider.finalized
+    assert provider.moe_hybridep_pad_uneven_dispatch_inputs is True
+
+
+def test_bridge_provider_forwards_linear_cp_mode(monkeypatch):
+    provider = _FakeProvider()
+    provider.linear_cp_mode = "headwise"
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(linear_cp_mode="chunkwise"), role="actor")
+    assert provider.finalized
+    assert provider.linear_cp_mode == "chunkwise"

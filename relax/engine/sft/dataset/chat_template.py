@@ -761,12 +761,22 @@ def _gemma4_context_safe_render(
         {**message, "content": hide(message.get("content"))} if message["role"] != "assistant" else message
         for message in messages
     ]
-    # Tool names, descriptions, and JSON-schema fields are rendered as system
-    # context, so their literal delimiters must not create supervised turns.
-    shadow_tools = hide(tools)
-    if shadow_messages == messages and shadow_tools == tools:
+    # Tool schemas are system context. Keep their input untouched: rewriting
+    # keys before Jinja's dictsort can change their order and character offsets.
+    mask_tool_context = any(token in str(tools) for token in delimiters)
+    if shadow_messages == messages and not mask_tool_context:
         return rendered_text
-    shadow = tokenizer.apply_chat_template(shadow_messages, tools=shadow_tools, tokenize=False, **template_kwargs)
+    shadow = tokenizer.apply_chat_template(shadow_messages, tools=tools, tokenize=False, **template_kwargs)
+    if mask_tool_context:
+        without_tools = tokenizer.apply_chat_template(shadow_messages, tools=[], tokenize=False, **template_kwargs)
+        role = next((message["role"] for message in messages if message["role"] in {"user", "assistant"}), None)
+        start = without_tools.find(_GEMMA4.header(role)) if role is not None else -1
+        if start < 0 or not shadow.endswith(without_tools[start:]):
+            raise RuntimeError("Could not align Gemma4 tool context with the rendered conversation")
+        # The unchanged conversation suffix locates the complete system/tool
+        # prefix, including schemas whose parameter names contain turn markers.
+        context_end = len(shadow) - len(without_tools[start:])
+        shadow = hide(shadow[:context_end]) + shadow[context_end:]
     restored = shadow
     for token, replacement in replacements.items():
         restored = restored.replace(replacement, token)

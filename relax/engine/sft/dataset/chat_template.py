@@ -736,7 +736,7 @@ def _gemma4_context_safe_render(
     """
     delimiters = ("<|turn>", "<turn|>", "<|tool_response>", "<tool_response|>")
     replacements: dict[str, str] = {}
-    source = rendered_text + str(messages)
+    source = rendered_text + str(messages) + str(tools)
     for index, token in enumerate(delimiters):
         attempt = 0
         while True:
@@ -754,16 +754,19 @@ def _gemma4_context_safe_render(
         if isinstance(value, list):
             return [hide(part) for part in value]
         if isinstance(value, dict):
-            return {key: hide(part) for key, part in value.items()}
+            return {hide(key): hide(part) for key, part in value.items()}
         return value
 
     shadow_messages = [
         {**message, "content": hide(message.get("content"))} if message["role"] != "assistant" else message
         for message in messages
     ]
-    if shadow_messages == messages:
+    # Tool names, descriptions, and JSON-schema fields are rendered as system
+    # context, so their literal delimiters must not create supervised turns.
+    shadow_tools = hide(tools)
+    if shadow_messages == messages and shadow_tools == tools:
         return rendered_text
-    shadow = tokenizer.apply_chat_template(shadow_messages, tools=tools, tokenize=False, **template_kwargs)
+    shadow = tokenizer.apply_chat_template(shadow_messages, tools=shadow_tools, tokenize=False, **template_kwargs)
     restored = shadow
     for token, replacement in replacements.items():
         restored = restored.replace(replacement, token)

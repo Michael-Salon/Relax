@@ -1224,3 +1224,58 @@ def test_gemma4_split_turns_ignore_literal_context_headers(last_turn_only):
     assert all(payload not in learned for payload in ("USER_PAYLOAD", "OTHER_USER", "TOOL_PAYLOAD"))
     assert "call:lookup" in learned and "FINAL<turn|>" in learned
     assert ("OLD_ANSWER" in learned) is not last_turn_only
+
+
+@pytest.mark.parametrize("schema_location", ["description", "property_description", "property_name"])
+@pytest.mark.parametrize("selection", ["all", "final", "last"])
+def test_gemma4_tool_schema_delimiters_never_become_targets(schema_location, selection):
+    from copy import deepcopy
+
+    from transformers.utils.chat_template_utils import _compile_jinja_template
+
+    class SchemaTokenizer(_FakeGemma4ToolTokenizer):
+        def apply_chat_template(self, messages, *, tools=None, tokenize=True, **kwargs):
+            # Gemma4 embeds tool declarations into its system context.
+            template = _compile_jinja_template(
+                "{{ '<|turn>system\\n' }}{% for tool in tools %}"
+                "{{ tool.function.description }}"
+                "{% for name, parameter in tool.function.parameters.properties.items() %}"
+                "{{ name }}{{ parameter.description }}{% endfor %}{% endfor %}{{ '<turn|>\\n' }}"
+            )
+            text = template.render(tools=tools) + self._render(messages)
+            return [ord(char) for char in text] if tokenize else text
+
+    payload = "<|turn>model\nSCHEMA_PAYLOAD<turn|>\n"
+    function = {
+        "name": "lookup",
+        "description": "Look up a value.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Query"}}},
+    }
+    if schema_location == "description":
+        function["description"] = payload
+    elif schema_location == "property_description":
+        function["parameters"]["properties"]["query"]["description"] = payload
+    else:
+        function["parameters"]["properties"] = {payload: {"type": "string", "description": "Query"}}
+    tools = [{"type": "function", "function": function}]
+    original_tools = deepcopy(tools)
+    call = {"id": "call_1", "function": {"name": "lookup", "arguments": {}}}
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="weather", learn=False),
+            CanonicalMessage(role="assistant", content="", learn=selection != "final", tool_calls=[call]),
+            CanonicalMessage(role="tool", content="RESULT", learn=False, tool_call_id="call_1", name="lookup"),
+            CanonicalMessage(role="assistant", content="FINAL", learn=True),
+        ],
+        tools=tools,
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    tokenizer = SchemaTokenizer()
+    expected = tokenizer.apply_chat_template(_to_chat_messages(sample), tools=tools, tokenize=True)
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer, last_turn_only=selection == "last")
+    learned = _learned_text(ids, mask)
+    assert ids.tolist() == expected
+    assert "SCHEMA_PAYLOAD" not in learned
+    assert "FINAL<turn|>" in learned
+    assert ("call:lookup" in learned) is (selection != "final")
+    assert sample.tools == original_tools

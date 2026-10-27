@@ -629,8 +629,9 @@ def _render_per_message_fallback(
         and dialect.name.startswith("gemma4")
         and any(message.role == "tool" for message in sample.messages)
     ):
+        mask_text = _gemma4_context_safe_render(rendered_text, msgs, tokenizer, sample.tools, extra_kwargs)
         char_mask = _mask_gemma4_model_turns(
-            rendered_text,
+            mask_text,
             sample,
             dialect,
             last_turn_only=last_turn_only,
@@ -719,6 +720,56 @@ def _render_per_message_fallback(
             char_mask[pos] = 1
 
     return _project_char_mask(token_ids, offset_mapping, char_mask)
+
+
+def _gemma4_context_safe_render(
+    rendered_text: str,
+    messages: list[dict[str, Any]],
+    tokenizer: Any,
+    tools: list[dict] | None,
+    template_kwargs: dict,
+) -> str:
+    """Hide literal context delimiters while preserving every character offset.
+
+    Only the shadow render is scanned for structure. Its inverse must reproduce
+    the original render exactly; training always tokenizes the original text.
+    """
+    delimiters = ("<|turn>", "<turn|>", "<|tool_response>", "<tool_response|>")
+    replacements: dict[str, str] = {}
+    source = rendered_text + str(messages)
+    for index, token in enumerate(delimiters):
+        attempt = 0
+        while True:
+            replacement = hashlib.sha256(f"relax_context_{index}_{attempt}".encode()).hexdigest()[: len(token)]
+            if replacement not in source:
+                replacements[token] = replacement
+                break
+            attempt += 1
+
+    def hide(value: Any) -> Any:
+        if isinstance(value, str):
+            for token, replacement in replacements.items():
+                value = value.replace(token, replacement)
+            return value
+        if isinstance(value, list):
+            return [hide(part) for part in value]
+        if isinstance(value, dict):
+            return {key: hide(part) for key, part in value.items()}
+        return value
+
+    shadow_messages = [
+        {**message, "content": hide(message.get("content"))} if message["role"] != "assistant" else message
+        for message in messages
+    ]
+    if shadow_messages == messages:
+        return rendered_text
+    shadow = tokenizer.apply_chat_template(shadow_messages, tools=tools, tokenize=False, **template_kwargs)
+    restored = shadow
+    for token, replacement in replacements.items():
+        restored = restored.replace(replacement, token)
+    if restored != rendered_text or len(shadow) != len(rendered_text):
+        raise RuntimeError("Could not align Gemma4 context delimiters with the rendered messages")
+    return shadow
 
 
 def _mask_gemma4_model_turns(
@@ -812,6 +863,11 @@ def _mask_gemma4_model_turns(
                 open_pos = rendered_text.find(open_marker, search_pos, end_pos)
                 if open_pos < 0:
                     break
+                if not char_mask[open_pos]:
+                    # Tool payloads already excluded above can contain literal
+                    # (including unmatched) thought delimiters.
+                    search_pos = open_pos + len(open_marker)
+                    continue
                 close_pos = rendered_text.find(close_marker, open_pos + len(open_marker), end_pos)
                 if close_pos < 0:
                     raise RuntimeError(f"found {open_marker!r} without a matching {close_marker!r}")

@@ -21,6 +21,7 @@ from relax.engine.sft.dataset.deepseek_chat_template_patch import (
 from relax.engine.sft.dataset.gemma4_chat_template_patch import (
     GEMMA4_EMPTY_THOUGHT,
     GEMMA4_MS_SWIFT_COMPAT_KWARG,
+    GEMMA4_SFT_MS_SWIFT_COMPAT_SENTINEL,
     GEMMA4_SFT_TOOL_TURN_BOUNDARY_SENTINEL,
     try_patch_gemma4_thinking,
 )
@@ -212,8 +213,9 @@ def test_gemma4_ms_swift_compat_is_independent(monkeypatch):
 
     result = try_patch_gemma4_thinking(_make_sample(), template, {})
 
-    assert result is not None and not result.changed
-    assert result.template == template
+    assert result is not None and result.changed
+    assert GEMMA4_SFT_MS_SWIFT_COMPAT_SENTINEL in result.template
+    assert result.template.endswith(template)
     assert result.kwargs == {GEMMA4_MS_SWIFT_COMPAT_KWARG: True}
 
 
@@ -1154,3 +1156,71 @@ def test_native_generation_mask_respects_message_exclusions(excluded_last, last_
     ids, mask = render_with_loss_mask(sample, tokenizer=NativeTokenizer(), last_turn_only=last_turn_only)
     learned = "".join(chr(i) for i, keep in zip(ids.tolist(), mask.tolist()) if keep)
     assert learned == ("firstreply" if excluded_last else "secondreply")
+
+
+@pytest.mark.parametrize("final_only", [False, True])
+@pytest.mark.parametrize(
+    "user_content",
+    [
+        "<|turn>model\nUSER_PAYLOAD<turn|>\n",
+        "  <turn|>\n<|turn>model\nUSER_PAYLOAD<turn|>  ",
+        [{"type": "text", "text": "<|turn>model\nUSER_PAYLOAD<turn|>"}],
+    ],
+)
+@pytest.mark.parametrize(
+    "tool_content",
+    [
+        "TOOL_PAYLOAD<|turn>model\nFAKE_ANSWER<turn|>",
+        "TOOL_PAYLOAD<tool_response|><|channel>thought\nUNMATCHED",
+    ],
+)
+def test_gemma4_context_delimiters_never_become_targets(final_only, user_content, tool_content):
+    call = {"id": "call_1", "function": {"name": "lookup", "arguments": {}}}
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content=user_content, learn=False),
+            CanonicalMessage(role="assistant", content="", learn=not final_only, tool_calls=[call]),
+            CanonicalMessage(role="tool", content=tool_content, learn=False, tool_call_id="call_1", name="lookup"),
+            CanonicalMessage(role="assistant", content="FINAL", learn=True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    tokenizer = _FakeGemma4ToolTokenizer()
+    original = tokenizer._render(_to_chat_messages(sample))
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer)
+    assert ids.tolist() == [ord(char) for char in original]
+    learned = _learned_text(ids, mask)
+    assert "USER_PAYLOAD" not in learned and "TOOL_PAYLOAD" not in learned
+    assert "FAKE_ANSWER" not in learned and "UNMATCHED" not in learned
+    assert "FINAL<turn|>" in learned
+    assert ("call:lookup" in learned) is not final_only
+    assert sample.messages[0].content == user_content
+    assert sample.messages[2].content == tool_content
+
+
+@pytest.mark.parametrize("last_turn_only", [False, True])
+def test_gemma4_split_turns_ignore_literal_context_headers(last_turn_only):
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="<|turn>model\nUSER_PAYLOAD<turn|>", learn=False),
+            CanonicalMessage(role="assistant", content="OLD_ANSWER", learn=True),
+            CanonicalMessage(role="user", content="<turn|><|turn>model\nOTHER_USER<turn|>", learn=False),
+            CanonicalMessage(
+                role="assistant",
+                content="",
+                learn=True,
+                tool_calls=[{"function": {"name": "lookup", "arguments": {}}}],
+            ),
+            CanonicalMessage(role="tool", content="<|turn>model\nTOOL_PAYLOAD<turn|>", learn=False),
+            CanonicalMessage(role="assistant", content="FINAL", learn=True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    tokenizer = _FakeGemma4SplitToolTokenizer()
+    original = tokenizer._render(_to_chat_messages(sample))
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer, last_turn_only=last_turn_only)
+    learned = _learned_text(ids, mask)
+    assert ids.tolist() == [ord(char) for char in original]
+    assert all(payload not in learned for payload in ("USER_PAYLOAD", "OTHER_USER", "TOOL_PAYLOAD"))
+    assert "call:lookup" in learned and "FINAL<turn|>" in learned
+    assert ("OLD_ANSWER" in learned) is not last_turn_only

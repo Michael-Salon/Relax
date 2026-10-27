@@ -678,4 +678,4 @@ Gemma4 模板补丁通过环境变量显式启用，需要将这些变量传入�
 - `GEMMA4_SFT_THINKING=1` 在每个新模型回合开始时插入空思考结构，不启用独立的系统思考前缀。
 - `GEMMA4_SFT_MS_SWIFT_COMPAT=1` 在传给模板的消息中省略工具关联字段，用于显式对齐 ms-swift。
 
-启用模板补丁并导出 HF 模型时，传入 `--save-hf-post-hook-path scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template`，并在导出时保留相同环境变量，使 `chat_template.jinja` 为推理保留训练时的回合边界。该 hook 只修改模板，视觉权重由现有导出器处理。
+启用模板补丁并导出 HF 模型时，传入 `--save-hf-post-hook-path scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template`，并在导出时保留相同环境变量，使 `chat_template.jinja` 为推理保留训练时的回合边界。导出模板同时保存 ms-swift 的关联字段过滤逻辑，重载后的 tokenizer 无需 Relax 预处理或环境变量即可应用。该 hook 只修改模板，视觉权重由现有导出器处理。

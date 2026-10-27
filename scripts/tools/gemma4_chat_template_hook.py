@@ -23,8 +23,8 @@ def patch_gemma4_chat_template(args: Any, hf_path: str, rollout_id: int, *, dtyp
         gemma4_sft_patch_options_from_env,
     )
 
-    thinking_enabled, tool_turn_boundary_enabled, _ = gemma4_sft_patch_options_from_env()
-    if not (thinking_enabled or tool_turn_boundary_enabled):
+    thinking_enabled, tool_turn_boundary_enabled, ms_swift_compat = gemma4_sft_patch_options_from_env()
+    if not (thinking_enabled or tool_turn_boundary_enabled or ms_swift_compat):
         logger.info("[gemma4-chat-template] skipped: Gemma4 SFT template patches are disabled")
         return
 
@@ -39,6 +39,7 @@ def patch_gemma4_chat_template(args: Any, hf_path: str, rollout_id: int, *, dtyp
         template,
         thinking_enabled=thinking_enabled,
         tool_turn_boundary_enabled=tool_turn_boundary_enabled,
+        ms_swift_compat=ms_swift_compat,
     )
     if result is None:
         logger.info("[gemma4-chat-template] skipped: exported template is not Gemma4")
@@ -52,4 +53,4 @@ def patch_gemma4_chat_template(args: Any, hf_path: str, rollout_id: int, *, dtyp
     with open(tmp_path, "w") as f:
         f.write(patched)
     os.replace(tmp_path, path)
-    logger.info(f"[gemma4-chat-template] rollout={rollout_id}: persisted SFT tool-turn boundaries")
+    logger.info(f"[gemma4-chat-template] rollout={rollout_id}: persisted SFT template patches")

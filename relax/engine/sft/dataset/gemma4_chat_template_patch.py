@@ -17,12 +17,24 @@ GEMMA4_SFT_TOOL_TURN_BOUNDARY_ENV = "GEMMA4_SFT_TOOL_TURN_BOUNDARY"
 GEMMA4_SFT_MS_SWIFT_COMPAT_ENV = "GEMMA4_SFT_MS_SWIFT_COMPAT"
 GEMMA4_SFT_THINKING_SENTINEL = "{# relax_gemma4_sft_thinking_v1 #}"
 GEMMA4_SFT_TOOL_TURN_BOUNDARY_SENTINEL = "{# relax_gemma4_sft_tool_turn_boundary_v1 #}"
+GEMMA4_SFT_MS_SWIFT_COMPAT_SENTINEL = "{# relax_gemma4_sft_ms_swift_compat_v1 #}"
 _TRUE_VALUES = {"1", "true", "True"}
 
 # The empty thought block ms-swift's `gemma4` template counts in the loss.
 # The official Jinja emits it only for generation prompts, not training turns.
 GEMMA4_EMPTY_THOUGHT = "<|channel>thought\n<channel|>"
 GEMMA4_MS_SWIFT_COMPAT_KWARG = "_relax_gemma4_ms_swift_compat"
+
+# Keep the input conversion in the template so an exported tokenizer applies
+# the same policy without depending on Relax's Python rendering entry point.
+_MS_SWIFT_COMPAT_PREFIX = (
+    "{%- set ns_relax_compat = namespace(messages=[]) -%}\n"
+    "{%- for message in messages -%}\n"
+    "    {%- set ns_relax_compat.messages = ns_relax_compat.messages + "
+    "[dict(message.items() | rejectattr('0', 'in', ['name', 'tool_call_id']))] -%}\n"
+    "{%- endfor -%}\n"
+    "{%- set messages = ns_relax_compat.messages -%}\n"
+)
 
 _ANCHOR = (
     "    {%- if thinking_text and thinking_gate -%}\n"
@@ -87,6 +99,7 @@ def _patch_template(
     *,
     thinking_enabled: bool,
     tool_turn_boundary_enabled: bool,
+    ms_swift_compat: bool = False,
 ) -> tuple[str, bool] | None:
     """Apply independently enabled thinking and tool-turn patches.
 
@@ -96,6 +109,10 @@ def _patch_template(
         return None
     patched = template
     changed = False
+
+    if ms_swift_compat and GEMMA4_SFT_MS_SWIFT_COMPAT_SENTINEL not in patched:
+        patched = GEMMA4_SFT_MS_SWIFT_COMPAT_SENTINEL + "\n" + _MS_SWIFT_COMPAT_PREFIX + patched
+        changed = True
 
     if thinking_enabled and GEMMA4_SFT_THINKING_SENTINEL not in patched:
         # A template exported by the first implementation can already contain
@@ -178,6 +195,7 @@ def try_patch_gemma4_thinking(
         template,
         thinking_enabled=thinking_enabled,
         tool_turn_boundary_enabled=tool_turn_boundary_enabled,
+        ms_swift_compat=ms_swift_compat,
     )
     if patched is None:
         return None

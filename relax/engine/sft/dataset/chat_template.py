@@ -26,7 +26,11 @@ from relax.engine.sft.dataset.deepseek_chat_template_patch import (
     split_embedded_thinking,
     try_patch_deepseek_chat_template,
 )
-from relax.engine.sft.dataset.gemma4_chat_template_patch import try_patch_gemma4_thinking
+from relax.engine.sft.dataset.gemma4_chat_template_patch import (
+    GEMMA4_MS_SWIFT_COMPAT_KWARG,
+    GEMMA4_SFT_TOOL_TURN_BOUNDARY_SENTINEL,
+    try_patch_gemma4_thinking,
+)
 from relax.engine.sft.dataset.qwen_chat_template_patch import (
     is_qwen38_chat_template,
     split_qwen38_leading_thinking,
@@ -62,6 +66,7 @@ def _to_chat_messages(
     *,
     normalize_deepseek_reasoning: bool = False,
     normalize_qwen38_reasoning: bool = False,
+    include_tool_correlation: bool = True,
 ) -> list[dict[str, Any]]:
     """Convert CanonicalMessage list to dict format expected by
     apply_chat_template."""
@@ -94,6 +99,10 @@ def _to_chat_messages(
             d["reasoning_content"] = reasoning_content
         if m.tool_calls is not None:
             d["tool_calls"] = m.tool_calls
+        if include_tool_correlation and m.tool_call_id is not None:
+            d["tool_call_id"] = m.tool_call_id
+        if include_tool_correlation and m.name is not None:
+            d["name"] = m.name
         out.append(d)
     return out
 
@@ -486,10 +495,12 @@ def _prepare_chat_messages(
     after the final user query; otherwise it considers every assistant message.
     """
     template_kwargs = dict(apply_chat_template_kwargs or {})
+    ms_swift_compat = bool(template_kwargs.pop(GEMMA4_MS_SWIFT_COMPAT_KWARG, False))
     add_non_thinking_prefix = bool(template_kwargs.pop("add_non_thinking_prefix", False))
     messages = _to_chat_messages(
         sample,
         normalize_deepseek_reasoning=normalize_deepseek_reasoning,
+        include_tool_correlation=not ms_swift_compat,
         normalize_qwen38_reasoning=normalize_qwen38_reasoning,
     )
     if not add_non_thinking_prefix or normalize_qwen38_reasoning:
@@ -612,10 +623,23 @@ def _render_per_message_fallback(
             "via offset_mapping would be unreliable."
         )
 
-    last_round_learn_indices = _last_round_learn_indices(sample) if last_turn_only else set()
-
-    char_mask = bytearray(len(rendered_text))  # zeros
     dialect = _detect_dialect(rendered_text)
+    if (
+        not message_selection_only
+        and dialect.name.startswith("gemma4")
+        and any(message.role == "tool" for message in sample.messages)
+    ):
+        char_mask = _mask_gemma4_model_turns(
+            rendered_text,
+            sample,
+            dialect,
+            last_turn_only=last_turn_only,
+            tool_turn_boundary=GEMMA4_SFT_TOOL_TURN_BOUNDARY_SENTINEL in (effective_template or ""),
+        )
+        return _project_char_mask(token_ids, offset_mapping, char_mask)
+
+    last_round_learn_indices = _last_round_learn_indices(sample) if last_turn_only else set()
+    char_mask = bytearray(len(rendered_text))  # zeros
     cursor = 0
     for msg_idx, msg in enumerate(sample.messages):
         if deepseek_dialect.name == "deepseek_v4":
@@ -694,15 +718,120 @@ def _render_per_message_fallback(
         for pos in range(mask_start, span_end):
             char_mask[pos] = 1
 
+    return _project_char_mask(token_ids, offset_mapping, char_mask)
+
+
+def _mask_gemma4_model_turns(
+    rendered_text: str,
+    sample: CanonicalSample,
+    dialect: _Dialect,
+    *,
+    last_turn_only: bool,
+    tool_turn_boundary: bool = False,
+) -> bytearray:
+    """Mask Gemma4 model turns while excluding embedded tool responses."""
+    selected_messages = sample.messages
+    if last_turn_only:
+        last_user_index = max((i for i, message in enumerate(selected_messages) if message.role == "user"), default=-1)
+        selected_messages = selected_messages[last_user_index + 1 :]
+    assistant_only = all(message.learn == (message.role == "assistant") for message in selected_messages)
+    learned_indices = [index for index, message in enumerate(selected_messages) if message.learn]
+    final_only = (
+        bool(selected_messages)
+        and learned_indices == [len(selected_messages) - 1]
+        and selected_messages[-1].role == "assistant"
+    )
+    if not assistant_only and not final_only:
+        raise RuntimeError("Gemma4 tool-call fallback supports all assistant messages or only the final assistant")
+
+    spans = []
+    model_header = dialect.header("assistant")
+    cursor = 0
+    while True:
+        header_pos = rendered_text.find(model_header, cursor)
+        if header_pos < 0:
+            break
+        content_start = header_pos + len(model_header)
+        end_pos = rendered_text.find(dialect.end, content_start)
+        if end_pos < 0:
+            raise RuntimeError(f"could not locate {dialect.end!r} for a Gemma4 model turn")
+        span_end = end_pos + len(dialect.end)
+        if span_end < len(rendered_text) and rendered_text[span_end] == "\n":
+            span_end += 1
+        spans.append((header_pos, content_start, end_pos, span_end))
+        cursor = span_end
+
+    if not spans:
+        raise RuntimeError("could not locate a Gemma4 model turn in rendered chat template output")
+    if last_turn_only and tool_turn_boundary:
+        # A tool trajectory can contain several model spans after the final
+        # user turn: each tool call now ends with its own supervised EOT, and
+        # the following tool response starts a fresh model span. Keep all of
+        # those spans, not just the final answer span.
+        last_user_index = max((i for i, message in enumerate(sample.messages) if message.role == "user"), default=-1)
+        final_round = sample.messages[last_user_index + 1 :]
+        if not any(message.role == "assistant" for message in final_round):
+            raise RuntimeError("could not locate an assistant message in the final Gemma4 user round")
+        span_count = 1 + sum(
+            message.role == "assistant"
+            and bool(message.tool_calls)
+            and index + 1 < len(final_round)
+            and final_round[index + 1].role == "tool"
+            for index, message in enumerate(final_round)
+        )
+        spans = spans[-span_count:]
+    elif last_turn_only:
+        spans = spans[-1:]
+    if final_only and not assistant_only:
+        final = sample.messages[-1]
+        content = final.content
+        if isinstance(content, list) and all(part.get("type") == "text" for part in content):
+            content = "".join(part["text"].strip() for part in content)
+        if not isinstance(content, str) or not content.strip() or final.tool_calls:
+            raise RuntimeError("Gemma4 final-only tool-call loss requires a nonempty final text answer")
+        header_pos, content_start, end_pos, span_end = spans[-1]
+        # A tool-call and its final answer can share one rendered model turn.
+        # Match the complete final payload at the turn's end, so earlier model
+        # text, calls and embedded tool responses remain context-only.
+        answer_start = rendered_text.rfind(content.strip(), content_start, end_pos)
+        if answer_start < 0 or rendered_text[answer_start + len(content.strip()) : end_pos].strip():
+            raise RuntimeError("Could not align the complete final Gemma4 answer with the rendered model turn")
+        spans = [(header_pos, answer_start, end_pos, span_end)]
+
+    char_mask = bytearray(len(rendered_text))
+    for _, content_start, end_pos, span_end in spans:
+        for pos in range(content_start, span_end):
+            char_mask[pos] = 1
+
+        excluded_spans = [("<|tool_response>", "<tool_response|>")]
+        if dialect.think_open is not None and dialect.think_close is not None:
+            excluded_spans.append((dialect.think_open, dialect.think_close))
+        for open_marker, close_marker in excluded_spans:
+            search_pos = content_start
+            while True:
+                open_pos = rendered_text.find(open_marker, search_pos, end_pos)
+                if open_pos < 0:
+                    break
+                close_pos = rendered_text.find(close_marker, open_pos + len(open_marker), end_pos)
+                if close_pos < 0:
+                    raise RuntimeError(f"found {open_marker!r} without a matching {close_marker!r}")
+                excluded_end = close_pos + len(close_marker)
+                for pos in range(open_pos, excluded_end):
+                    char_mask[pos] = 0
+                search_pos = excluded_end
+    return char_mask
+
+
+def _project_char_mask(token_ids: list[int], offset_mapping: list[tuple[int, int]], char_mask: bytearray):
+    """Project a rendered-text character mask onto tokenizer offsets."""
     psum = [0] * (len(char_mask) + 1)
-    for i, c in enumerate(char_mask):
-        psum[i + 1] = psum[i] + c
+    for index, value in enumerate(char_mask):
+        psum[index + 1] = psum[index] + value
 
     loss_mask = [0] * len(token_ids)
-    for i, (s, e) in enumerate(offset_mapping):
-        if e > s and psum[e] - psum[s] > 0:
-            loss_mask[i] = 1
-
+    for index, (start, end) in enumerate(offset_mapping):
+        if end > start and psum[end] - psum[start] > 0:
+            loss_mask[index] = 1
     return torch.tensor(token_ids, dtype=torch.long), torch.tensor(loss_mask, dtype=torch.long)
 
 

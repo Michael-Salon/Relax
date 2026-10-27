@@ -1414,6 +1414,10 @@ def train_one_step(
                 mtp_output_layer_calls = (
                     0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
+                # Chunked SFT returns hidden states. Keep the full sequence in
+                # model precision; the loss upcasts each bounded logits chunk.
+                if getattr(args, "sft_chunked_logits", False) and (args.fp16 or args.bf16):
+                    forward_kwargs["fp32_output"] = False
                 with _bypass_output_layer(
                     model,
                     mtp_output_layer_calls=mtp_output_layer_calls,

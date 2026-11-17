@@ -55,10 +55,13 @@ def test_serial_and_prefetched_art_rewards_and_rows_are_identical(monkeypatch, i
 
 
 @pytest.mark.parametrize("release_error", [False, True])
-def test_art_reward_failure_joins_workers_and_rolls_back_before_any_tq_put(monkeypatch, release_error):
+@pytest.mark.parametrize("failure", ["reward", "convert"])
+def test_art_prepublication_failure_joins_workers_and_rolls_back(monkeypatch, release_error, failure):
     from threading import enumerate as threads
 
     import ray._private.internal_api as api
+
+    from relax.utils import utils as transfer
 
     old, cache, freed = object(), {}, []
     cache[(2, 0)] = old
@@ -78,6 +81,7 @@ def test_art_reward_failure_joins_workers_and_rolls_back_before_any_tq_put(monke
     )
     adapter = SimpleNamespace(build_rollout_request=lambda *_a, **_kw: {"height": 1, "width": 1})
     monkeypatch.setattr(ng, "_TRAJECTORY_REF_CACHE", cache)
+    monkeypatch.setattr(transfer, "CURRENT_ROLLOUT_BATCH", [])
     monkeypatch.setattr(ng, "_load_adapter", lambda _args: adapter)
     monkeypatch.setattr(ng, "_get_engines", lambda *_args: [object(), object()])
     monkeypatch.setattr(ng, "_get_samples", lambda *_args: groups)
@@ -91,7 +95,8 @@ def test_art_reward_failure_joins_workers_and_rolls_back_before_any_tq_put(monke
     def score(_args, group):
         for sample in group:
             sample._prefetched_generative_reward = (4, {"ocr": 1.0}, True)
-        raise OSError("reward failed")
+        if failure == "reward":
+            raise OSError("reward failed")
 
     def free(refs, *, local_only):
         assert not any(t.name.startswith(("rollout-prepare", "rollout-reward")) for t in threads())
@@ -103,11 +108,17 @@ def test_art_reward_failure_joins_workers_and_rolls_back_before_any_tq_put(monke
     monkeypatch.setattr(ng, "_prepare_generated_group", prepare)
     monkeypatch.setattr(gr, "prefetch_group_rewards", score)
     monkeypatch.setattr(api, "free", free)
-    monkeypatch.setattr(
-        "relax.utils.utils.transfer_batch_to_data_system", lambda *_a, **_k: pytest.fail("Early TQ put")
-    )
-    with pytest.raises(OSError, match="reward failed"):
-        ng.generate_rollout(args, 4, object(), object())
+
+    def convert(*_args):
+        raise OSError("convert failed")
+
+    async def put(**_kwargs):
+        pytest.fail("Early TQ put")
+
+    monkeypatch.setattr(transfer, "convert_samples_to_train_data", convert)
+    with pytest.raises(OSError, match="reward failed|convert failed"):
+        ng.generate_rollout(args, 4, object(), SimpleNamespace(async_put=put))
+    assert transfer.CURRENT_ROLLOUT_BATCH == []
     assert cache[(2, 0)] is old
     assert all(not hasattr(sample, "_prefetched_generative_reward") for group in groups for sample in group)
     if release_error:

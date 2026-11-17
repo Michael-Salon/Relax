@@ -843,6 +843,10 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
                     sample for sample in transfer_utils.CURRENT_ROLLOUT_BATCH if id(sample) not in owned_ids
                 ]
                 release_images()
+                for group in out_groups:
+                    for sample in group:
+                        if hasattr(sample, "_prefetched_generative_reward"):
+                            del sample._prefetched_generative_reward
         reward_time = time.time() - reward_t0
 
     _log_raw_reward(args, rollout_id, out_groups)

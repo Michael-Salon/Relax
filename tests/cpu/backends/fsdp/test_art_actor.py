@@ -117,6 +117,32 @@ def test_actor_has_two_updates_one_publish_or_global_zero_skip(monkeypatch, cons
         assert actor.model.weight[0, 1] > 0.05
 
 
+@pytest.mark.parametrize("invalid", [None, "wave", "pending", "runtime", "scorer", "hook", "type"])
+def test_art_overlap_is_bounded_and_requires_the_raw_reward_barrier(invalid):
+    args = _profile()
+    args.sampling_config.update(overlap_group_processing=True, overlap_pending_groups=3, generation_prefetch=True)
+    args.reward_runtime = "cpu"
+    args.reward_scorer_path = "relax.engine.rewards.textpecker_reward.TextPeckerRewardScorer"
+    args.custom_reward_post_process_path = "relax.engine.rewards.generative.post_process"
+    if invalid == "wave":
+        args.sampling_config["wave_groups"] = 2
+    elif invalid == "pending":
+        args.sampling_config["overlap_pending_groups"] = 4
+    elif invalid == "runtime":
+        args.reward_runtime = "remote"
+    elif invalid == "scorer":
+        args.reward_scorer_path = "custom.scorer"
+    elif invalid == "hook":
+        args.custom_reward_post_process_path = "custom.hook"
+    elif invalid == "type":
+        args.sampling_config["overlap_group_processing"] = 1
+    if invalid is None:
+        validate_generative_config(args)
+    else:
+        with pytest.raises(ValueError, match="ART"):
+            validate_generative_config(args)
+
+
 @pytest.mark.parametrize("changed", [None, "seed", "steps", "k", "lr", "budget"])
 def test_resume_accepts_legacy_scheduling_keys_but_keeps_math_and_optimizer_strict(tmp_path, changed):
     import json

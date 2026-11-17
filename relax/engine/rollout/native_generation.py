@@ -245,6 +245,34 @@ def _wave_group_count(sampling: Mapping[str, Any], num_engines: int) -> int:
     return count
 
 
+def _validate_pipeline_options(args: Any, sampling: Mapping[str, Any], data_system_client: Any) -> bool:
+    """Reject unsafe overlap settings before consuming the data source.
+
+    A hook's capability marker only promises to consume the prefetched raw
+    results. It does not make an arbitrary scorer independent across groups.
+    """
+    overlap = sampling.get("overlap_group_processing", False)
+    if type(overlap) is not bool:
+        raise ValueError("overlap_group_processing must be a boolean")
+    if not overlap:
+        return False
+    pending = sampling.get("overlap_pending_groups", 2)
+    if type(pending) is not int or pending < 1:
+        raise ValueError("overlap_pending_groups must be a positive integer")
+    if (
+        getattr(args, "reward_runtime", "cpu") != "cpu"
+        or getattr(args, "reward_scorer_path", None) != "relax.engine.rewards.textpecker_reward.TextPeckerRewardScorer"
+        or data_system_client is None
+    ):
+        raise ValueError("Group overlap currently requires CPU TextPecker and a training data-system client")
+    from relax.utils.utils import load_function
+
+    hook_path = getattr(args, "custom_reward_post_process_path", None)
+    if not hook_path or getattr(load_function(hook_path), "supports_prefetched_generative_rewards", False) is not True:
+        raise ValueError("Group overlap requires a hook declaring supports_prefetched_generative_rewards=True")
+    return True
+
+
 _LOGGED_CANDIDATE_IMAGE_SHAPE = False
 
 
@@ -548,11 +576,12 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
         return evaluate_rollout(args, rollout_id)
 
     sampling = getattr(args, "sampling_config", None) or {}
-    if sampling.get("overlap_group_processing") or sampling.get("generation_prefetch"):
-        raise ValueError("Group overlap and generation prefetch require the separate ART performance branch.")
+    overlap = _validate_pipeline_options(args, sampling, data_system_client)
     adapter = _load_adapter(args)
     engines = _get_engines(args, data_system_client)
     wave_groups = _wave_group_count(sampling, len(engines))
+    if overlap and wave_groups != 1:
+        raise ValueError("Bounded group overlap currently requires wave_groups=1")
 
     # Pin the trained/stochastic SDE steps ONCE per rollout and hand every request
     # the same explicit list. With --sampling-config sde_resample_per_rollout this
@@ -565,7 +594,19 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
         sampling = {**sampling, "sde_indices": rollout_sde}
         logger.info(f"[rollout {rollout_id}] trained SDE steps: {rollout_sde}")
 
+    lookahead = sampling.get("generation_prefetch", False)
+    if type(lookahead) is not bool:
+        raise ValueError("generation_prefetch must be a boolean")
+    if lookahead and (
+        not overlap
+        or sampling.get("algorithm") != "art"
+        or wave_groups != 1
+        or sampling.get("overlap_pending_groups", 2) < 2
+    ):
+        raise ValueError("ART prefetch requires overlap with >=2 slots and wave_groups=1")
     groups = _get_samples(data_source, args.rollout_batch_size)
+    if lookahead and any(len(group) != len(engines) for group in groups):
+        raise ValueError("ART prefetch requires one candidate per engine")
     art_budget = {"sizes": [], "guidance": []} if sampling.get("algorithm") == "art" else None
     if art_budget is not None:
         from relax.engine.rollout.art_replay import art_cache_limits
@@ -610,6 +651,28 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
         except Exception:
             logger.exception("Unpublished ART trajectory release failed; retaining owner refs for diagnosis")
 
+    pipeline = None
+    if overlap:
+        from relax.engine.rewards.generative import prefetch_group_rewards
+        from relax.engine.rollout.group_pipeline import GroupPipeline
+
+        def prepare(group: List[Sample], responses: List[Dict[str, Any]]) -> List[Sample]:
+            return _prepare_generated_group(
+                args,
+                sampling,
+                adapter,
+                rollout_id,
+                fp,
+                group,
+                responses,
+                **({"art_budget": art_budget} if art_budget is not None else {}),
+            )
+
+        def score(group: List[Sample]) -> None:
+            prefetch_group_rewards(args, group)
+
+        pipeline = GroupPipeline(prepare, score, sampling.get("overlap_pending_groups", 2))
+
     gen_t0 = time.time()
 
     # Dispatch a WAVE of groups at a time, with every candidate of the wave
@@ -646,23 +709,100 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
             requests.append(group_requests)
         return requests
 
+    next_requests = None
     failed = True
     try:
         for wave_start in range(0, len(groups), wave_groups):
             wave = groups[wave_start : wave_start + wave_groups]
-            wave_responses = _dispatch_groups(
-                engines, build_wave_requests(wave), use_art_transport=sampling.get("algorithm") == "art"
-            )
-            for group, responses in zip(wave, wave_responses):
-                _prepare_generated_group(
-                    args, sampling, adapter, rollout_id, fp, group, responses, art_budget=art_budget
+            if pipeline is not None:
+                pipeline.reserve(slots=2 if lookahead and wave_start + wave_groups < len(groups) else 1)
+            if lookahead:
+                requests = next_requests if next_requests is not None else build_wave_requests(wave)
+                next_wave = groups[wave_start + wave_groups : wave_start + 2 * wave_groups]
+                next_requests = build_wave_requests(next_wave) if next_wave else None
+                wave_responses = _dispatch_groups(
+                    engines, requests, next_group_requests=next_requests, lookahead=True, use_art_transport=True
                 )
+            else:
+                requests = build_wave_requests(wave)
+                wave_responses = _dispatch_groups(
+                    engines, requests, use_art_transport=sampling.get("algorithm") == "art"
+                )
+
+            for group, responses in zip(wave, wave_responses):
+                if pipeline is not None:
+                    pipeline.submit(group, responses)
+                else:
+                    _prepare_generated_group(
+                        args,
+                        sampling,
+                        adapter,
+                        rollout_id,
+                        fp,
+                        group,
+                        responses,
+                        **({"art_budget": art_budget} if art_budget is not None else {}),
+                    )
                 out_groups.append(group)
             del wave_responses, responses
+        if pipeline is not None:
+            pipeline.finish()
         failed = False
     finally:
-        if failed and art_budget is not None:
-            discard_unpublished()
+        cleanup_errors = []
+        if lookahead:
+            import ray
+
+            cleanup = []
+            for engine in engines:
+                try:
+                    cleanup.append(engine.clear_art_lookahead.remote())
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+            # Await all actors even if a submission or another actor cleanup failed.
+            for ref in cleanup:
+                try:
+                    ray.get(ref)
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+        if pipeline is not None:
+            try:
+                pipeline.close()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            failed = True
+        if overlap or (failed and art_budget is not None):
+            for uri in set(_CANDIDATE_IMAGE_CACHE) - initial_image_keys:
+                if _CANDIDATE_IMAGE_ROLLOUT_IDS.get(uri) == int(rollout_id):
+                    get_cached_candidate_image(uri, remove=True)
+            if failed:
+                release_failed = False
+                if art_budget is not None:
+                    try:
+                        _discard_unpublished_art_refs(rollout_id, initial_trajectory_keys)
+                    except Exception:
+                        release_failed = True
+                        logger.exception(
+                            "Unpublished ART trajectory release failed; retaining owner refs for diagnosis"
+                        )
+                if not release_failed:
+                    for key in set(_TRAJECTORY_REF_CACHE) - initial_trajectory_keys:
+                        if key[0] == int(rollout_id):
+                            _TRAJECTORY_REF_CACHE.pop(key, None)
+        # Failed rounds must not leave prefetched scores or cached image arrays.
+        # Successful raw scoring has already released its images. Sidecars are
+        # left to the existing retention guard, never deleted after a possible put.
+        for group in groups:
+            for sample in group:
+                if failed and hasattr(sample, "_prefetched_generative_reward"):
+                    del sample._prefetched_generative_reward
+                for output in ((sample.train_metadata or {}).get("manifest") or {}).get("outputs", []):
+                    uri = output.get("uri", "")
+                    if overlap and uri.startswith("memory://"):
+                        get_cached_candidate_image(uri, remove=True)
+        if cleanup_errors:
+            raise RuntimeError("ART lookahead cleanup failed") from cleanup_errors[0]
     gen_time = time.time() - gen_t0
 
     # Transfer the generated groups to the data system: convert each group to the
@@ -966,7 +1106,9 @@ def _log_rollout_perf(args, rollout_id: int, gen_time: float, reward_time: float
 
     ``perf/rollout_time`` (generation dispatch + image save) and
     ``perf/reward_time`` (convert + reward scoring + TQ transfer), logged via
-    the framework tracking sink from the RolloutManager worker.
+    the framework tracking sink from the RolloutManager worker. With group
+    overlap, rollout_time instead covers the sampling/reward pipeline through
+    its drain; reward_time is only the final advantage/conversion/TQ barrier.
     """
     from relax.utils.metrics.metric_utils import compute_rollout_step
 
@@ -975,14 +1117,18 @@ def _log_rollout_perf(args, rollout_id: int, gen_time: float, reward_time: float
         "perf/reward_time": float(reward_time),
         "rollout/step": compute_rollout_step(args, rollout_id),
     }
+    overlapped = bool((getattr(args, "sampling_config", None) or {}).get("overlap_group_processing", False))
+    metrics["perf/group_overlap"] = float(overlapped)
+    generation_label = "sampling_reward_pipeline_wall" if overlapped else "gen_time"
+    reward_label = "finalize+convert+tq_time" if overlapped else "reward+convert+tq_time"
     if gen_time > 0 and num_samples:
         metrics["perf/rollout_samples_per_s"] = float(num_samples) / gen_time
     # Print to the run log too — every other emission site does, and without it
     # "which stage is slow" cannot be triaged from the log alone. Note
     # reward_time covers convert + scoring + TQ put, not scoring alone.
     logger.info(
-        f"[rollout {rollout_id}] samples={num_samples} gen_time={gen_time:.2f}s "
-        f"reward+convert+tq_time={reward_time:.2f}s "
+        f"[rollout {rollout_id}] samples={num_samples} {generation_label}={gen_time:.2f}s "
+        f"{reward_label}={reward_time:.2f}s "
         f"samples_per_s={metrics.get('perf/rollout_samples_per_s', 0.0):.3f}"
     )
     _emit_tracking_metrics(args, metrics, int(metrics["rollout/step"]), "native generate_rollout")
@@ -1499,6 +1645,8 @@ def _dispatch_groups(
     group_requests: List[List[Dict[str, Any]]],
     *,
     use_art_transport: bool = False,
+    next_group_requests: Optional[List[List[Dict[str, Any]]]] = None,
+    lookahead: bool = False,
 ) -> List[List[Dict[str, Any]]]:
     """Spread every candidate of every group across all engines; regroup on
     return.
@@ -1527,12 +1675,27 @@ def _dispatch_groups(
     shards: List[List[int]] = [[] for _ in engines]
     for i in range(len(flat)):
         shards[i % len(engines)].append(i)
+    next_flat = (
+        [request for group in next_group_requests for request in group] if next_group_requests is not None else None
+    )
+    if lookahead and (
+        not use_art_transport or len(flat) != len(engines) or (next_flat is not None and len(next_flat) != len(flat))
+    ):
+        raise ValueError("ART prefetch requires one candidate per engine and ART transport")
     refs, order = [], []
     for engine, idxs in zip(engines, shards):
         if not idxs:
             continue
-        generate = engine.generate_art_batch_transport if use_art_transport else engine.generate_batch
-        refs.append(generate.remote([flat[i] for i in idxs]))
+        if lookahead:
+            refs.append(
+                engine.generate_art_lookahead.remote(
+                    [flat[i] for i in idxs],
+                    next_requests=[next_flat[i] for i in idxs] if next_flat is not None else None,
+                )
+            )
+        else:
+            generate = engine.generate_art_batch_transport if use_art_transport else engine.generate_batch
+            refs.append(generate.remote([flat[i] for i in idxs]))
         order.append(idxs)
 
     out: List[Optional[Dict[str, Any]]] = [None] * len(flat)
